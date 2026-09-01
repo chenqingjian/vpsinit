@@ -65,17 +65,18 @@ xray() {
   esac
 }
 openssl() { [[ "${1:-}" == rand && "${2:-}" == -hex && "${3:-}" == 8 ]] && printf '0123456789abcdef\n'; }
-[[ "$(printf 'a\n' | prompt_uuid)" == '550e8400-e29b-41d4-a716-446655440000' ]] || fail 'UUID automatic generation failed'
-[[ "$(printf 'b\n550e8400-e29b-41d4-a716-446655440001\n' | prompt_uuid)" == '550e8400-e29b-41d4-a716-446655440001' ]] || fail 'UUID manual selection failed'
-[[ "$(printf '\nb\n550e8400-e29b-41d4-a716-446655440002\n' | prompt_uuid 2>/dev/null)" == '550e8400-e29b-41d4-a716-446655440002' ]] || fail 'empty UUID method was incorrectly accepted'
-[[ "$(printf 'a\n' | prompt_short_id)" == '0123456789abcdef' ]] || fail 'Short ID automatic generation failed'
-[[ "$(printf 'b\nAABBCCDDEEFF0011\n' | prompt_short_id)" == 'aabbccddeeff0011' ]] || fail 'Short ID manual selection failed'
-[[ "$(printf '\nb\n0011223344556677\n' | prompt_short_id 2>/dev/null)" == '0011223344556677' ]] || fail 'empty Short ID method was incorrectly accepted'
+[[ "$(printf '\n' | prompt_uuid)" == '550e8400-e29b-41d4-a716-446655440000' ]] || fail 'UUID Enter-default automatic generation failed'
+[[ "$(printf 'a\n550e8400-e29b-41d4-a716-446655440001\n' | prompt_uuid)" == '550e8400-e29b-41d4-a716-446655440001' ]] || fail 'UUID manual selection failed'
+[[ "$(printf 'b\n\n' | prompt_uuid 2>/dev/null)" == '550e8400-e29b-41d4-a716-446655440000' ]] || fail 'invalid UUID method did not retry'
+[[ "$(printf '\n' | prompt_short_id)" == '0123456789abcdef' ]] || fail 'Short ID Enter-default automatic generation failed'
+[[ "$(printf 'a\nAABBCCDDEEFF0011\n' | prompt_short_id)" == 'aabbccddeeff0011' ]] || fail 'Short ID manual selection failed'
+[[ "$(printf 'b\n\n' | prompt_short_id 2>/dev/null)" == '0123456789abcdef' ]] || fail 'invalid Short ID method did not retry'
 check_reality_target() { [[ "$1" == manual.example ]]; }
 [[ "$(printf '\nmanual.example\n' | prompt_target 2>/dev/null)" == manual.example ]] || fail 'manual REALITY target input failed'
 unset -f check_reality_target
-[[ "$(printf 'a\n' | prompt_reality_keys)" == $'private-auto\npublic-auto' ]] || fail 'REALITY automatic key generation failed'
-[[ "$(printf '\nprivate-manual\npublic-manual\n' | prompt_reality_keys)" == $'private-manual\npublic-manual' ]] || fail 'REALITY manual key input failed'
+[[ "$(printf '\n' | prompt_reality_keys)" == $'private-auto\npublic-auto' ]] || fail 'REALITY Enter-default automatic key generation failed'
+[[ "$(printf 'a\nprivate-manual\npublic-manual\n' | prompt_reality_keys)" == $'private-manual\npublic-manual' ]] || fail 'REALITY manual key input failed'
+[[ "$(printf 'b\n\n' | prompt_reality_keys 2>/dev/null)" == $'private-auto\npublic-auto' ]] || fail 'invalid REALITY key method did not retry'
 unset -f xray openssl
 
 ORIGINAL_IPV6_CONF_DIR="$IPV6_CONF_DIR"
@@ -180,7 +181,7 @@ grep -q 'vpsinit xray install' <<<"$help_output" || fail 'help missing xray inst
 grep -q 'vpsinit system' <<<"$help_output" || fail 'help missing system'
 grep -q 'vpsinit system ufw-status' <<<"$help_output" || fail 'help missing UFW status command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.25' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.26' ]] || fail 'version command output mismatch'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'
@@ -223,14 +224,14 @@ grep -q 'MaxAuthTries 8' "$ROOT_DIR/vpsinit.sh" || fail 'SSH MaxAuthTries mismat
 grep -Fq '请粘贴一整行 root SSH 公钥' "$ROOT_DIR/vpsinit.sh" || fail 'manual root SSH key prompt missing'
 grep -Fq 'wizard_step "是否覆盖 root SSH 公钥？" y configure_root_key' "$ROOT_DIR/vpsinit.sh" || fail 'root SSH key step is not enabled by default'
 grep -Fq 'port="$(read_required_port '\''请输入新的 SSH 端口'\'')"' "$ROOT_DIR/vpsinit.sh" || fail 'SSH port still has a default value'
-grep -Fq 'UUID 获取方式 [a：自动生成；b：手动指定]' "$ROOT_DIR/vpsinit.sh" || fail 'UUID method prompt mismatch'
-grep -Fq 'Short ID 获取方式 [a：自动生成；b：手动指定]' "$ROOT_DIR/vpsinit.sh" || fail 'Short ID method prompt mismatch'
-[[ "$(grep -Fc '请输入 a 或 b。' "$ROOT_DIR/vpsinit.sh")" -eq 2 ]] || fail 'UUID or Short ID invalid-choice prompt mismatch'
+grep -Fq 'UUID 获取方式 [回车：自动生成；a：手动指定]' "$ROOT_DIR/vpsinit.sh" || fail 'UUID method prompt mismatch'
+grep -Fq 'Short ID 获取方式 [回车：自动生成；a：手动指定]' "$ROOT_DIR/vpsinit.sh" || fail 'Short ID method prompt mismatch'
+[[ "$(grep -Fc '请按回车自动生成，或输入 a 手动指定。' "$ROOT_DIR/vpsinit.sh")" -eq 3 ]] || fail 'Xray credential invalid-choice prompt mismatch'
 grep -Fq '请输入 REALITY 目标域名' "$ROOT_DIR/vpsinit.sh" || fail 'manual REALITY target prompt missing'
 if grep -Eq 'DEFAULT_(ROOT_SSH_KEY|XRAY_UUID|XRAY_SHORT_ID)|REALITY 目标域名 \[www\.bing\.com\]|请输入新的 SSH 端口.*58911' "$ROOT_DIR/vpsinit.sh"; then fail 'removed default values remain'; fi
 grep -Fq '"target": "$target:443"' "$ROOT_DIR/vpsinit.sh" || fail 'REALITY target is not derived from domain and port 443'
 grep -Fq '"serverNames": [' "$ROOT_DIR/vpsinit.sh" || fail 'REALITY serverNames config missing'
-grep -Fq 'REALITY 密钥获取方式 [回车：随后手动输入私钥和公钥；a：自动生成]' "$ROOT_DIR/vpsinit.sh" || fail 'REALITY key selection prompt is ambiguous'
+grep -Fq 'REALITY 密钥获取方式 [回车：自动生成；a：手动指定]' "$ROOT_DIR/vpsinit.sh" || fail 'REALITY key selection prompt mismatch'
 grep -q 'SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpsinit.conf"' "$ROOT_DIR/vpsinit.sh" || fail 'SSH drop-in priority mismatch'
 grep -Fq '检测到当前 SSH 配置端口：${configured_ports[0]}，将替换为 ${port}。' "$ROOT_DIR/vpsinit.sh" || fail 'existing random SSH port is not accepted for replacement'
 grep -Fq '检测到多个 SSH 配置端口：${configured_port_list}，拒绝自动接管。' "$ROOT_DIR/vpsinit.sh" || fail 'multiple SSH port conflict guard missing'

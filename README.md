@@ -21,8 +21,7 @@
 - LLMNR/5355 检查与关闭
 - 公网 IPv6 检测；检测到 IPv6 时可选择关闭，并阻止在 IPv6 SSH 会话中误操作
 - Xray VLESS + TCP + REALITY + Vision
-- Xray UUID 和 Short ID 必须明确选择自动生成或手动输入
-- REALITY 公私钥默认进入手动输入流程，也可选择自动生成
+- Xray UUID、REALITY 公私钥和 Short ID 均可直接回车自动生成，输入 `a` 手动指定
 - REALITY 目标域名必须手动输入，不内置默认站点
 - Xray 安装、升级、修改、卸载、状态和日志
 - Xray 客户端链接和 Mihomo 配置仅写入当前终端，不进入工具日志或状态文件

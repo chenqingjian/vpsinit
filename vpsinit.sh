@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.25"
+TOOL_VERSION="0.1.26"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -868,17 +868,17 @@ valid_ipv4() { awk -F. 'NF==4 {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || $i<0 || 
 prompt_uuid() {
   local mode value
   while true; do
-    read -r -p 'UUID 获取方式 [a：自动生成；b：手动指定]：' mode
+    read -r -p 'UUID 获取方式 [回车：自动生成；a：手动指定]：' mode
     case "${mode,,}" in
-      a) xray uuid; return ;;
-      b)
+      '') xray uuid; return ;;
+      a)
         while true; do
           read -r -p '请输入 UUID：' value
           valid_uuid "$value" && { printf '%s\n' "${value,,}"; return; }
           log_error "UUID 格式无效。"
         done
         ;;
-      *) log_error "请输入 a 或 b。" ;;
+      *) log_error "请按回车自动生成，或输入 a 手动指定。" ;;
     esac
   done
 }
@@ -886,23 +886,23 @@ prompt_uuid() {
 prompt_reality_keys() {
   local mode private public derived output
   while true; do
-    read -r -p 'REALITY 密钥获取方式 [回车：随后手动输入私钥和公钥；a：自动生成]：' mode
+    read -r -p 'REALITY 密钥获取方式 [回车：自动生成；a：手动指定]：' mode
     case "${mode,,}" in
       '')
-        read -r -p '请输入 REALITY 私钥：' private
-        read -r -p '请输入 REALITY 公钥：' public
-        derived="$(xray x25519 -i "$private" 2>/dev/null | awk -F': ' 'tolower($1) ~ /(public|password)/ {print $2; exit}' || true)"
-        [[ -n "$derived" && "$derived" == "$public" ]] || die "REALITY 公私钥不配套。" 2
-        break
-        ;;
-      a)
         output="$(xray x25519)"
         private="$(printf '%s\n' "$output" | awk -F': ' 'tolower($1) ~ /private/ {print $2; exit}')"
         public="$(printf '%s\n' "$output" | awk -F': ' 'tolower($1) ~ /(public|password)/ {print $2; exit}')"
         [[ -n "$private" && -n "$public" ]] || die "无法解析 Xray 生成的 REALITY 密钥。" 6
         break
         ;;
-      *) log_error "此处仅用于选择获取方式，请按回车进入手动输入，或输入 a 自动生成。" ;;
+      a)
+        read -r -p '请输入 REALITY 私钥：' private
+        read -r -p '请输入 REALITY 公钥：' public
+        derived="$(xray x25519 -i "$private" 2>/dev/null | awk -F': ' 'tolower($1) ~ /(public|password)/ {print $2; exit}' || true)"
+        [[ -n "$derived" && "$derived" == "$public" ]] || die "REALITY 公私钥不配套。" 2
+        break
+        ;;
+      *) log_error "请按回车自动生成，或输入 a 手动指定。" ;;
     esac
   done
   printf '%s\n%s\n' "$private" "$public"
@@ -911,17 +911,17 @@ prompt_reality_keys() {
 prompt_short_id() {
   local mode value
   while true; do
-    read -r -p 'Short ID 获取方式 [a：自动生成；b：手动指定]：' mode
+    read -r -p 'Short ID 获取方式 [回车：自动生成；a：手动指定]：' mode
     case "${mode,,}" in
-      a) openssl rand -hex 8; return ;;
-      b)
+      '') openssl rand -hex 8; return ;;
+      a)
         while true; do
           read -r -p '请输入 Short ID（偶数长度十六进制，2-16 字符）：' value
           valid_short_id "$value" && { printf '%s\n' "${value,,}"; return; }
           log_error "Short ID 格式无效。"
         done
         ;;
-      *) log_error "请输入 a 或 b。" ;;
+      *) log_error "请按回车自动生成，或输入 a 手动指定。" ;;
     esac
   done
 }

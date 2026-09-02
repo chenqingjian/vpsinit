@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.28"
+TOOL_VERSION="0.1.29"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -228,6 +228,13 @@ read_free_port() {
 
 ufw_active() {
   command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'
+}
+
+ufw_has_allow_rule() {
+  local port="$1"
+  command -v ufw >/dev/null 2>&1 || return 1
+  ufw status 2>/dev/null | grep -Eq "^${port}/tcp[[:space:]]+ALLOW" \
+    || ufw show added 2>/dev/null | grep -Eq "^ufw allow ${port}/tcp([[:space:]]|$)"
 }
 
 ufw_allow_owned() {
@@ -554,7 +561,7 @@ configure_ufw() {
   [[ -n "$ssh_port" ]] || ssh_port=22
   ufw default deny incoming
   ufw default allow outgoing
-  if ! ufw status | grep -Eq "^${ssh_port}/tcp[[:space:]]+ALLOW"; then
+  if ! ufw_has_allow_rule "$ssh_port"; then
     ufw allow "$ssh_port/tcp" comment 'vpsinit-ssh'
   fi
   ufw --force enable
@@ -571,6 +578,61 @@ show_ufw_status() {
   ufw status verbose
   printf '\n===== UFW 已添加的入站/出站规则 =====\n'
   ufw show added
+}
+
+configure_ufw_standalone() {
+  show_ufw_status
+  ask_yes_no "是否配置并启用 UFW？" n || { log_info "保持当前 UFW 配置。"; return 0; }
+  confirm_danger "UFW 将设置为默认拒绝入站、允许出站，并放行当前 SSH 端口。" || return 0
+  configure_ufw
+}
+
+enable_ufw() {
+  local ssh_port rule_added=0
+  show_ufw_status
+  if ! package_is_installed ufw || ! command -v ufw >/dev/null 2>&1; then
+    die "当前系统未安装 UFW，请先执行 vpsinit system ufw。" 4
+  fi
+  if ufw_active; then
+    log_ok "UFW 已处于启用状态。"
+    return 0
+  fi
+  ssh_port="$(effective_ssh_port || true)"
+  [[ -n "$ssh_port" ]] || die "无法识别当前 SSH 端口，拒绝启用 UFW。" 4
+  if ufw_has_allow_rule "$ssh_port"; then
+    log_ok "已确认当前 SSH 端口 $ssh_port/tcp 存在放行规则。"
+  else
+    log_warn "当前 SSH 端口 $ssh_port/tcp 尚无放行规则，启用前将自动添加。"
+  fi
+  ask_yes_no "是否启用 UFW？" n || { log_info "保持 UFW 停用。"; return 0; }
+  confirm_danger "启用 UFW 将立即应用现有规则；请确认云安全组和当前 SSH 端口配置正确。" || return 0
+  if ! ufw_has_allow_rule "$ssh_port"; then
+    ufw allow "$ssh_port/tcp" comment 'vpsinit-ssh'
+    rule_added=1
+  fi
+  if ! ufw --force enable || ! ufw_active; then
+    (( rule_added == 0 )) || ufw --force delete allow "$ssh_port/tcp" >/dev/null 2>&1 || true
+    die "UFW 启用失败；本次新增的 SSH 放行规则已尝试撤销。" 6
+  fi
+  state_set UFW_SSH_PORT "$ssh_port"
+  log_ok "UFW 已启用，当前 SSH 端口 $ssh_port/tcp 已放行。"
+}
+
+disable_ufw() {
+  show_ufw_status
+  if ! package_is_installed ufw || ! command -v ufw >/dev/null 2>&1; then
+    log_warn "当前系统未安装 UFW，无需停用。"
+    return 0
+  fi
+  if ! ufw_active; then
+    log_ok "UFW 已处于停用状态，现有规则保持不变。"
+    return 0
+  fi
+  ask_yes_no "是否停用 UFW？" n || { log_info "保持 UFW 启用。"; return 0; }
+  confirm_danger "停用 UFW 会停止主机防火墙过滤，现有规则会保留以供后续恢复。" || return 0
+  ufw disable
+  ufw_active && die "UFW 停用后仍显示为 active。" 6
+  log_ok "UFW 已停用，现有规则未删除。"
 }
 
 read_range() {
@@ -632,6 +694,93 @@ EOF
   systemctl enable --now fail2ban
   systemctl restart fail2ban
   log_ok "Fail2ban 已启用：10 分钟内失败 $retries 次，封禁 $minutes 分钟。"
+}
+
+show_fail2ban_status() {
+  if ! package_is_installed fail2ban || ! command -v fail2ban-client >/dev/null 2>&1; then
+    log_warn "当前系统未安装 Fail2ban，无法查看状态。"
+    return 0
+  fi
+  printf '\n===== Fail2ban 服务状态 =====\n'
+  if systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+    printf '开机启动：已启用\n'
+  else
+    printf '开机启动：未启用\n'
+  fi
+  if systemctl is-active --quiet fail2ban; then
+    printf '运行状态：active\n'
+    printf '\n===== Fail2ban Jail 状态 =====\n'
+    fail2ban-client status || true
+    printf '\n===== SSH Jail 状态 =====\n'
+    fail2ban-client status sshd || true
+    printf '\n===== SSH Jail 封禁动作 =====\n'
+    fail2ban-client get sshd actions || true
+  else
+    printf '运行状态：inactive\n'
+    if [[ -r "$FAIL2BAN_JAIL" ]]; then
+      printf '\n===== vpsinit SSH Jail 配置 =====\n'
+      sed -n '/^[[:space:]]*#/d; /^[[:space:]]*$/d; p' "$FAIL2BAN_JAIL"
+    fi
+  fi
+}
+
+configure_fail2ban_standalone() {
+  show_fail2ban_status
+  ask_yes_no "是否配置并启用 Fail2ban？" n || { log_info "保持当前 Fail2ban 配置。"; return 0; }
+  configure_fail2ban
+}
+
+fail2ban_configured_ssh_port() {
+  [[ -r "$FAIL2BAN_JAIL" ]] || return 1
+  sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' "$FAIL2BAN_JAIL" | tail -n 1
+}
+
+enable_fail2ban() {
+  local current_port configured_port
+  show_fail2ban_status
+  if ! package_is_installed fail2ban || ! command -v fail2ban-client >/dev/null 2>&1; then
+    die "当前系统未安装 Fail2ban，请先执行 vpsinit system fail2ban。" 4
+  fi
+  if systemctl is-active --quiet fail2ban && systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+    log_ok "Fail2ban 已处于运行且开机启用状态。"
+    return 0
+  fi
+  if [[ ! -r "$FAIL2BAN_JAIL" ]] || ! grep -Fqx '# Managed by vpsinit' "$FAIL2BAN_JAIL"; then
+    die "未找到由 vpsinit 管理的 Fail2ban SSH jail，请先执行 vpsinit system fail2ban。" 4
+  fi
+  if [[ ! -r "$FAIL2BAN_SSHD_FILTER" ]] || ! grep -Fqx '# Managed by vpsinit' "$FAIL2BAN_SSHD_FILTER"; then
+    die "未找到由 vpsinit 管理的 Fail2ban SSH 过滤器，请先执行 vpsinit system fail2ban。" 4
+  fi
+  current_port="$(effective_ssh_port || true)"
+  configured_port="$(fail2ban_configured_ssh_port || true)"
+  [[ -n "$current_port" && "$configured_port" == "$current_port" ]] \
+    || die "Fail2ban SSH 端口配置（${configured_port:-未知}）与当前 SSH 端口（${current_port:-未知}）不一致，请重新执行 vpsinit system fail2ban。" 4
+  fail2ban-client -t
+  ask_yes_no "是否启用 Fail2ban？" n || { log_info "保持 Fail2ban 停用。"; return 0; }
+  systemctl enable --now fail2ban
+  if ! systemctl is-active --quiet fail2ban || ! fail2ban-client status sshd >/dev/null 2>&1; then
+    systemctl disable --now fail2ban >/dev/null 2>&1 || true
+    die "Fail2ban 启用后服务或 sshd jail 验证失败，已重新停用服务。" 6
+  fi
+  log_ok "Fail2ban 已启用，sshd jail 正常运行。"
+}
+
+disable_fail2ban() {
+  show_fail2ban_status
+  if ! package_is_installed fail2ban || ! command -v fail2ban-client >/dev/null 2>&1; then
+    log_warn "当前系统未安装 Fail2ban，无需停用。"
+    return 0
+  fi
+  if ! systemctl is-active --quiet fail2ban && ! systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+    log_ok "Fail2ban 已处于停止且未启用状态，现有配置保持不变。"
+    return 0
+  fi
+  ask_yes_no "是否停用 Fail2ban？" n || { log_info "保持 Fail2ban 启用。"; return 0; }
+  systemctl disable --now fail2ban
+  if systemctl is-active --quiet fail2ban || systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+    die "Fail2ban 停用验证失败。" 6
+  fi
+  log_ok "Fail2ban 已停止并取消开机启动，jail 和过滤器配置未删除。"
 }
 
 configure_unattended_upgrades() {
@@ -1530,7 +1679,14 @@ show_help() {
   vpsinit system ipv6-status
   vpsinit system ipv6-enable
   vpsinit system ipv6-disable
+  vpsinit system ufw
   vpsinit system ufw-status
+  vpsinit system ufw-enable
+  vpsinit system ufw-disable
+  vpsinit system fail2ban
+  vpsinit system fail2ban-status
+  vpsinit system fail2ban-enable
+  vpsinit system fail2ban-disable
   vpsinit xray install|upgrade|configure|uninstall|status|logs
   vpsinit self-update
   vpsinit self-uninstall
@@ -1586,7 +1742,7 @@ main() {
   ensure_base_dirs
   start_logging
   case "${1:-}:${2:-}" in
-    xray:status|xray:logs|system:ufw-status|system:ipv6-status) ;;
+    xray:status|xray:logs|system:ufw-status|system:fail2ban-status|system:ipv6-status) ;;
     *) acquire_lock; purge_legacy_xray_client_state ;;
   esac
   case "${1:-}" in
@@ -1598,7 +1754,14 @@ main() {
         ipv6-status) show_ipv6_status ;;
         ipv6-enable) enable_ipv6 ;;
         ipv6-disable) disable_ipv6 ;;
+        ufw) configure_ufw_standalone ;;
         ufw-status) show_ufw_status ;;
+        ufw-enable) enable_ufw ;;
+        ufw-disable) disable_ufw ;;
+        fail2ban) configure_fail2ban_standalone ;;
+        fail2ban-status) show_fail2ban_status ;;
+        fail2ban-enable) enable_fail2ban ;;
+        fail2ban-disable) disable_fail2ban ;;
         *) show_help; exit 2 ;;
       esac
       ;;

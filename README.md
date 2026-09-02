@@ -17,7 +17,7 @@
 
 - root 密码与单行 SSH 公钥
 - SSH 高位端口，必须手动输入
-- UFW、Fail2ban、自动安全更新
+- UFW、Fail2ban、自动安全更新；UFW 和 Fail2ban 均支持独立配置、状态查看、启用与停用
 - LLMNR/5355 检查与关闭
 - IPv6 状态检查、关闭与恢复；关闭前保存接口状态，并阻止在 IPv6 SSH 会话中误操作
 - Xray VLESS + TCP + REALITY + Vision
@@ -41,7 +41,14 @@ vpsinit system ipv6
 vpsinit system ipv6-status
 vpsinit system ipv6-enable
 vpsinit system ipv6-disable
+vpsinit system ufw
 vpsinit system ufw-status
+vpsinit system ufw-enable
+vpsinit system ufw-disable
+vpsinit system fail2ban
+vpsinit system fail2ban-status
+vpsinit system fail2ban-enable
+vpsinit system fail2ban-disable
 vpsinit xray install
 vpsinit xray upgrade
 vpsinit xray configure
@@ -53,6 +60,8 @@ vpsinit self-uninstall
 ```
 
 `vpsinit system ipv6` 进入交互式 IPv6 检测与关闭步骤。`ipv6-status` 只读显示内核参数、接口开关、地址、默认路由及相关持久化配置。`ipv6-disable` 和 `ipv6-enable` 都会先显示当前状态；关闭时保存操作前的接口状态，恢复时优先按该快照还原。旧版本关闭 IPv6 或快照不存在时，恢复命令会明确提示并统一启用现有接口。公网 IPv6 地址是否出现仍取决于云厂商分配和网络配置。
+
+`vpsinit system ufw` 和 `vpsinit system fail2ban` 分别进入独立配置流程。两者的 `enable`、`disable` 命令都会先显示状态，停用时保留规则或 jail 配置。UFW 启用前会确认当前 SSH 端口存在放行规则；Fail2ban 启用前会校验配置、当前 SSH 端口及 `sshd` jail。Fail2ban 沿用系统解析出的封禁动作（例如 nftables），不强制通过 UFW 封禁。
 
 Xray 默认使用 `443/tcp`。如果端口已被其他服务占用，安装流程要求手动输入其他端口，不会停止或覆盖原服务。
 

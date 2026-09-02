@@ -46,6 +46,21 @@ dpkg-query() { [[ "${1:-}" == -W && "${3:-}" == ufw ]] && printf 'install ok ins
 assert_true package_is_installed ufw
 assert_false package_is_installed fail2ban
 unset -f dpkg-query
+ufw() {
+  case "${1:-}:${2:-}" in
+    status:) printf 'Status: inactive\n' ;;
+    show:added) printf "ufw allow 58911/tcp comment 'vpsinit-ssh'\n" ;;
+    *) return 1 ;;
+  esac
+}
+assert_true ufw_has_allow_rule 58911
+assert_false ufw_has_allow_rule 22
+unset -f ufw
+ORIGINAL_FAIL2BAN_JAIL="$FAIL2BAN_JAIL"
+FAIL2BAN_JAIL="$RUNTIME_DIR/fail2ban-jail.local"
+printf '# Managed by vpsinit\n[sshd]\nport = 58911\n' > "$FAIL2BAN_JAIL"
+[[ "$(fail2ban_configured_ssh_port)" == 58911 ]] || fail 'Fail2ban configured SSH port parse failed'
+FAIL2BAN_JAIL="$ORIGINAL_FAIL2BAN_JAIL"
 [[ "$(printf '\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest manual@example\n' | prompt_root_ssh_key 2>/dev/null)" == 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest manual@example' ]] || fail 'manual SSH key input failed'
 [[ "$(printf '\n58911\n' | read_required_port 'test' 2>/dev/null)" == 58911 ]] || fail 'required SSH port input failed'
 
@@ -206,9 +221,14 @@ grep -q 'vpsinit system ipv6' <<<"$help_output" || fail 'help missing IPv6 comma
 grep -q 'vpsinit system ipv6-status' <<<"$help_output" || fail 'help missing IPv6 status command'
 grep -q 'vpsinit system ipv6-enable' <<<"$help_output" || fail 'help missing IPv6 enable command'
 grep -q 'vpsinit system ipv6-disable' <<<"$help_output" || fail 'help missing IPv6 disable command'
+grep -q 'vpsinit system ufw-enable' <<<"$help_output" || fail 'help missing UFW enable command'
+grep -q 'vpsinit system ufw-disable' <<<"$help_output" || fail 'help missing UFW disable command'
 grep -q 'vpsinit system ufw-status' <<<"$help_output" || fail 'help missing UFW status command'
+grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing Fail2ban status command'
+grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
+grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.28' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.29' ]] || fail 'version command output mismatch'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'
@@ -244,13 +264,29 @@ grep -Fq 'ipv6) configure_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 command dis
 grep -Fq 'ipv6-status) show_ipv6_status' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 status command dispatch missing'
 grep -Fq 'ipv6-enable) enable_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 enable command dispatch missing'
 grep -Fq 'ipv6-disable) disable_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable command dispatch missing'
+grep -Fq 'ufw) configure_ufw_standalone' "$ROOT_DIR/vpsinit.sh" || fail 'UFW configure command dispatch missing'
 grep -Fq 'ufw-status) show_ufw_status' "$ROOT_DIR/vpsinit.sh" || fail 'UFW status command dispatch missing'
-grep -Fq 'xray:status|xray:logs|system:ufw-status|system:ipv6-status)' "$ROOT_DIR/vpsinit.sh" || fail 'read-only status command incorrectly takes mutation lock'
+grep -Fq 'ufw-enable) enable_ufw' "$ROOT_DIR/vpsinit.sh" || fail 'UFW enable command dispatch missing'
+grep -Fq 'ufw-disable) disable_ufw' "$ROOT_DIR/vpsinit.sh" || fail 'UFW disable command dispatch missing'
+grep -Fq 'fail2ban) configure_fail2ban_standalone' "$ROOT_DIR/vpsinit.sh" || fail 'Fail2ban configure command dispatch missing'
+grep -Fq 'fail2ban-status) show_fail2ban_status' "$ROOT_DIR/vpsinit.sh" || fail 'Fail2ban status command dispatch missing'
+grep -Fq 'fail2ban-enable) enable_fail2ban' "$ROOT_DIR/vpsinit.sh" || fail 'Fail2ban enable command dispatch missing'
+grep -Fq 'fail2ban-disable) disable_fail2ban' "$ROOT_DIR/vpsinit.sh" || fail 'Fail2ban disable command dispatch missing'
+grep -Fq 'xray:status|xray:logs|system:ufw-status|system:fail2ban-status|system:ipv6-status)' "$ROOT_DIR/vpsinit.sh" || fail 'read-only status command incorrectly takes mutation lock'
 if grep -Eq 'system:ipv6-(enable|disable)[^)]*\)' "$ROOT_DIR/vpsinit.sh"; then fail 'IPv6 mutation command incorrectly bypasses operation lock'; fi
+if grep -Eq 'system:(ufw|fail2ban)-(enable|disable)[^)]*\)' "$ROOT_DIR/vpsinit.sh"; then fail 'firewall mutation command incorrectly bypasses operation lock'; fi
 grep -Fq 'show_ipv6_status' <<<"$(declare -f enable_ipv6)" || fail 'IPv6 enable does not show status first'
 grep -Fq 'show_ipv6_status' <<<"$(declare -f disable_ipv6)" || fail 'IPv6 disable does not show status first'
 grep -Fq 'save_ipv6_restore_snapshot' <<<"$(declare -f disable_ipv6)" || fail 'IPv6 disable does not save restore snapshot'
 grep -Fq '[[ ! -e "$IPV6_SYSCTL" && -z "$external" ]]' <<<"$(declare -f enable_ipv6)" || fail 'IPv6 enable can ignore persistent disable configuration'
+grep -Fq 'show_ufw_status' <<<"$(declare -f enable_ufw)" || fail 'UFW enable does not show status first'
+grep -Fq 'show_ufw_status' <<<"$(declare -f disable_ufw)" || fail 'UFW disable does not show status first'
+grep -Fq 'ufw_has_allow_rule "$ssh_port"' <<<"$(declare -f enable_ufw)" || fail 'UFW enable does not protect current SSH port'
+grep -Fq 'show_fail2ban_status' <<<"$(declare -f enable_fail2ban)" || fail 'Fail2ban enable does not show status first'
+grep -Fq 'show_fail2ban_status' <<<"$(declare -f disable_fail2ban)" || fail 'Fail2ban disable does not show status first'
+grep -Fq 'fail2ban-client -t' <<<"$(declare -f enable_fail2ban)" || fail 'Fail2ban enable does not validate configuration'
+grep -Fq 'configured_port' <<<"$(declare -f enable_fail2ban)" || fail 'Fail2ban enable does not verify SSH port'
+grep -Fq 'fail2ban-client get sshd actions' <<<"$(declare -f show_fail2ban_status)" || fail 'Fail2ban status does not show ban actions'
 grep -Fq 'ufw status verbose' "$ROOT_DIR/vpsinit.sh" || fail 'UFW verbose status output missing'
 grep -Fq 'ufw show added' "$ROOT_DIR/vpsinit.sh" || fail 'UFW configured rules output missing'
 grep -Fq 'apt-get 收到 SIGKILL' "$ROOT_DIR/vpsinit.sh" || fail 'apt-get SIGKILL diagnosis missing'

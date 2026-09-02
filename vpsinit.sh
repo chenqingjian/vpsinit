@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.27"
+TOOL_VERSION="0.1.28"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -24,6 +24,7 @@ FAIL2BAN_JAIL="/etc/fail2ban/jail.d/90-vpsinit-sshd.local"
 FAIL2BAN_SSHD_FILTER="/etc/fail2ban/filter.d/vpsinit-sshd.conf"
 IPV6_SYSCTL="/etc/sysctl.d/90-vpsinit-disable-ipv6.conf"
 IPV6_CONF_DIR="/proc/sys/net/ipv6/conf"
+IPV6_SNAPSHOT="$STATE_DIR/ipv6-before-disable.conf"
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
 YELLOW=$'\033[0;33m'
@@ -668,7 +669,13 @@ EOF
 }
 
 global_ipv6_addresses() {
+  command -v ip >/dev/null 2>&1 || return 0
   ip -6 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}' | sort -u
+}
+
+link_local_ipv6_addresses() {
+  command -v ip >/dev/null 2>&1 || return 0
+  ip -6 -o addr show scope link 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $2 " " $4}' | sort -u
 }
 
 ipv6_enabled_interfaces() {
@@ -682,6 +689,26 @@ ipv6_enabled_interfaces() {
   done
 }
 
+ipv6_runtime_fully_disabled() {
+  local file found=0
+  for file in "$IPV6_CONF_DIR"/*/disable_ipv6; do
+    [[ -r "$file" ]] || continue
+    found=1
+    [[ "$(<"$file")" == 1 ]] || return 1
+  done
+  (( found == 1 ))
+}
+
+ipv6_all_interfaces_enabled() {
+  local file found=0
+  for file in "$IPV6_CONF_DIR"/*/disable_ipv6; do
+    [[ -r "$file" ]] || continue
+    found=1
+    [[ "$(<"$file")" == 0 ]] || return 1
+  done
+  (( found == 1 ))
+}
+
 snapshot_ipv6_disable_states() {
   local file interface
   for file in "$IPV6_CONF_DIR"/*/disable_ipv6; do
@@ -689,6 +716,148 @@ snapshot_ipv6_disable_states() {
     interface="$(basename "$(dirname "$file")")"
     printf '%s\t%s\n' "$interface" "$(<"$file")"
   done
+}
+
+ipv6_snapshot_valid() {
+  [[ -r "$IPV6_SNAPSHOT" ]] || return 1
+  grep -Fqx '# Managed by vpsinit' "$IPV6_SNAPSHOT" || return 1
+  awk -F '\t' '
+    $1 == "all" && $2 ~ /^[01]$/ {all=1}
+    $1 == "default" && $2 ~ /^[01]$/ {default_value=1}
+    END {exit !(all && default_value)}
+  ' "$IPV6_SNAPSHOT"
+}
+
+save_ipv6_restore_snapshot() {
+  local temp
+  ensure_base_dirs
+  temp="$(make_temp)"
+  {
+    printf '# Managed by vpsinit\n'
+    printf '# IPv6 disable-state snapshot version 1\n'
+    snapshot_ipv6_disable_states
+  } > "$temp"
+  install -o root -g root -m 0600 "$temp" "$IPV6_SNAPSHOT"
+  ipv6_snapshot_valid || die "IPv6 关闭前状态快照校验失败。" 6
+}
+
+ipv6_snapshot_value() {
+  local interface="$1"
+  awk -F '\t' -v wanted="$interface" '$1 == wanted && $2 ~ /^[01]$/ {print $2; exit}' "$IPV6_SNAPSHOT"
+}
+
+apply_ipv6_enable_values() {
+  local file interface value default_value=0 use_snapshot=0
+  if ipv6_snapshot_valid; then
+    use_snapshot=1
+    default_value="$(ipv6_snapshot_value default)"
+  fi
+  for file in "$IPV6_CONF_DIR"/*/disable_ipv6; do
+    [[ -w "$file" ]] || continue
+    interface="$(basename "$(dirname "$file")")"
+    value=""
+    (( use_snapshot == 0 )) || value="$(ipv6_snapshot_value "$interface")"
+    value="${value:-$default_value}"
+    printf '%s\n' "$value" > "$file"
+  done
+}
+
+ipv6_enable_values_verified() {
+  local file interface expected default_value=0 use_snapshot=0 found=0
+  if ipv6_snapshot_valid; then
+    use_snapshot=1
+    default_value="$(ipv6_snapshot_value default)"
+  fi
+  for file in "$IPV6_CONF_DIR"/*/disable_ipv6; do
+    [[ -r "$file" ]] || continue
+    found=1
+    interface="$(basename "$(dirname "$file")")"
+    expected=""
+    (( use_snapshot == 0 )) || expected="$(ipv6_snapshot_value "$interface")"
+    expected="${expected:-$default_value}"
+    [[ "$(<"$file")" == "$expected" ]] || return 1
+  done
+  (( found == 1 ))
+}
+
+ipv6_kernel_cmdline_disabled() {
+  [[ -r /proc/cmdline ]] && grep -Eq '(^|[[:space:]])ipv6\.disable=1([[:space:]]|$)' /proc/cmdline
+}
+
+ipv6_external_disable_configs() {
+  local file
+  local -a candidates=(
+    /etc/sysctl.conf
+    /etc/sysctl.d/*.conf
+    /run/sysctl.d/*.conf
+    /usr/local/lib/sysctl.d/*.conf
+    /usr/lib/sysctl.d/*.conf
+  )
+  for file in "${candidates[@]}"; do
+    [[ -f "$file" && "$file" != "$IPV6_SYSCTL" ]] || continue
+    grep -HEn '^[[:space:]]*net[./]ipv6[./]conf[./][^[:space:]=]+[./]disable_ipv6[[:space:]]*=[[:space:]]*1([[:space:]]|$)' "$file" || true
+  done
+}
+
+show_ipv6_status() {
+  local addresses links enabled_interfaces external recorded
+  addresses="$(global_ipv6_addresses || true)"
+  links="$(link_local_ipv6_addresses || true)"
+  enabled_interfaces="$(ipv6_enabled_interfaces || true)"
+  external="$(ipv6_external_disable_configs)"
+  recorded="$(state_get IPV6_DISABLED 2>/dev/null || true)"
+
+  printf '\n===== IPv6 当前状态 =====\n'
+  if ipv6_kernel_cmdline_disabled; then
+    printf '内核启动参数：ipv6.disable=1（已禁用）\n'
+  else
+    printf '内核启动参数：未禁用 IPv6\n'
+  fi
+  if [[ -e "$IPV6_SYSCTL" ]]; then
+    if grep -Fqx '# Managed by vpsinit' "$IPV6_SYSCTL"; then
+      printf 'vpsinit 持久化配置：已存在\n'
+    else
+      printf 'vpsinit 持久化配置：路径被非 vpsinit 文件占用\n'
+    fi
+  else
+    printf 'vpsinit 持久化配置：不存在\n'
+  fi
+  printf 'vpsinit 状态记录：%s\n' "${recorded:-无}"
+  printf '关闭前状态快照：%s\n' "$([[ -e "$IPV6_SNAPSHOT" ]] && printf '存在' || printf '不存在')"
+
+  printf '\n接口开关（1=关闭，0=启用）：\n'
+  local file interface
+  for file in "$IPV6_CONF_DIR"/*/disable_ipv6; do
+    [[ -r "$file" ]] || continue
+    interface="$(basename "$(dirname "$file")")"
+    printf '  %s=%s\n' "$interface" "$(<"$file")"
+  done
+  [[ -n "$addresses" ]] && printf '\n公网 IPv6 地址：\n%s\n' "$addresses" || printf '\n公网 IPv6 地址：无\n'
+  [[ -n "$links" ]] && printf '\n链路本地 IPv6 地址：\n%s\n' "$links" || printf '\n链路本地 IPv6 地址：无\n'
+  if command -v ip >/dev/null 2>&1; then
+    printf '\nIPv6 默认路由：\n'
+    ip -6 route show default 2>/dev/null || true
+  fi
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    current_ssh_uses_ipv6 && printf '当前 SSH：IPv6\n' || printf '当前 SSH：IPv4\n'
+  else
+    printf '当前 SSH：无法判断\n'
+  fi
+  [[ -z "$external" ]] || printf '\n其他关闭 IPv6 的 sysctl 配置：\n%s\n' "$external"
+
+  printf '\n结论：'
+  if ipv6_kernel_cmdline_disabled; then
+    printf 'IPv6 被内核启动参数禁用。\n'
+  elif ipv6_runtime_fully_disabled; then
+    printf 'IPv6 已完全关闭。\n'
+  elif [[ -n "$addresses" ]]; then
+    printf 'IPv6 已启用，并检测到公网 IPv6 地址。\n'
+  elif [[ -n "$enabled_interfaces" ]]; then
+    printf 'IPv6 已启用，但没有公网 IPv6 地址。\n'
+  else
+    printf 'IPv6 状态不完整或无法确定。\n'
+  fi
+  return 0
 }
 
 current_ssh_uses_ipv6() {
@@ -713,21 +882,12 @@ restore_ipv6_config() {
   done < "$states_backup"
 }
 
-configure_ipv6() {
-  local addresses enabled_interfaces temp backup="" states_backup
-  install_packages iproute2 procps curl ca-certificates
-  addresses="$(global_ipv6_addresses)"
-  enabled_interfaces="$(ipv6_enabled_interfaces)"
-  if [[ -z "$addresses" && -z "$enabled_interfaces" ]]; then
+disable_ipv6() {
+  local enabled_interfaces temp backup="" states_backup snapshot_created=0
+  show_ipv6_status
+  if ipv6_runtime_fully_disabled; then
     log_ok "IPv6 已处于关闭状态。"
     return
-  fi
-
-  if [[ -n "$addresses" ]]; then
-    log_info "检测到以下公网 IPv6 地址："
-    printf '%s\n' "$addresses"
-  else
-    log_info "未检测到公网 IPv6 地址，但 IPv6 功能仍处于开启状态。"
   fi
   ask_yes_no "是否关闭本机 IPv6？" n || { log_info "保留 IPv6。"; return 0; }
   if current_ssh_uses_ipv6; then
@@ -735,8 +895,15 @@ configure_ipv6() {
     return 4
   fi
   confirm_danger "关闭 IPv6 会移除公网 IPv6 地址；请确认当前服务器可通过 IPv4 管理。" || return 0
+  install_packages iproute2 procps curl ca-certificates
   if [[ -e "$IPV6_SYSCTL" ]] && ! grep -q '^# Managed by vpsinit$' "$IPV6_SYSCTL"; then
     die "$IPV6_SYSCTL 已存在且不属于 vpsinit。" 4
+  fi
+  if [[ -e "$IPV6_SNAPSHOT" ]]; then
+    ipv6_snapshot_valid || die "$IPV6_SNAPSHOT 已存在但不是有效的 vpsinit 状态快照。" 4
+  else
+    save_ipv6_restore_snapshot
+    snapshot_created=1
   fi
   states_backup="$(make_temp)"
   snapshot_ipv6_disable_states > "$states_backup"
@@ -751,6 +918,7 @@ EOF
   install -o root -g root -m 0644 "$temp" "$IPV6_SYSCTL"
   if ! sysctl -p "$IPV6_SYSCTL" >/dev/null; then
     restore_ipv6_config "$backup" "$states_backup"
+    (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
     die "应用 IPv6 关闭配置失败，已恢复原配置。" 6
   fi
   sleep 1
@@ -758,14 +926,69 @@ EOF
   if [[ -n "$enabled_interfaces" || -n "$(global_ipv6_addresses)" ]]; then
     [[ -n "$enabled_interfaces" ]] && log_error "以下接口的 IPv6 仍处于启用状态：$(printf '%s' "$enabled_interfaces" | paste -sd ',')"
     restore_ipv6_config "$backup" "$states_backup"
+    (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
     die "IPv6 关闭后的状态验证失败，已恢复原配置。" 6
   fi
   if ! getent ahostsv4 deb.debian.org >/dev/null || ! curl -4fsSI --max-time 15 https://deb.debian.org/ >/dev/null; then
     restore_ipv6_config "$backup" "$states_backup"
+    (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
     die "关闭 IPv6 后 IPv4 DNS 或 HTTPS 验证失败，已恢复原配置。" 6
   fi
   state_set IPV6_DISABLED 1
   log_ok "IPv6 已关闭，IPv4 DNS 和 HTTPS 验证正常。"
+}
+
+enable_ipv6() {
+  local external states_backup config_backup="" use_snapshot=0
+  show_ipv6_status
+  external="$(ipv6_external_disable_configs)"
+  if ipv6_all_interfaces_enabled \
+    && ! ipv6_kernel_cmdline_disabled \
+    && [[ ! -e "$IPV6_SYSCTL" && -z "$external" ]]; then
+    log_ok "IPv6 已处于启用状态，无需恢复。"
+    state_delete IPV6_DISABLED
+    return
+  fi
+  if ipv6_kernel_cmdline_disabled; then
+    die "检测到内核启动参数 ipv6.disable=1，请先人工修改启动参数并重启。" 4
+  fi
+  [[ -z "$external" ]] || { printf '%s\n' "$external" >&2; die "IPv6 由非 vpsinit sysctl 配置关闭，拒绝自动覆盖。" 4; }
+  if [[ -e "$IPV6_SYSCTL" ]] && ! grep -Fqx '# Managed by vpsinit' "$IPV6_SYSCTL"; then
+    die "$IPV6_SYSCTL 已存在且不属于 vpsinit。" 4
+  fi
+  if [[ -e "$IPV6_SNAPSHOT" ]]; then
+    ipv6_snapshot_valid || die "$IPV6_SNAPSHOT 已存在但不是有效的 vpsinit 状态快照。" 4
+    use_snapshot=1
+    log_info "将按照 ipv6-disable 保存的关闭前状态恢复 IPv6。"
+  else
+    log_warn "未找到关闭前状态快照，将统一启用所有现有接口的 IPv6。"
+  fi
+  ask_yes_no "是否恢复本机 IPv6？" n || { log_info "保持当前 IPv6 配置。"; return 0; }
+  confirm_danger "恢复 IPv6 会重新开放 IPv6 网络栈，但不保证云厂商已分配公网 IPv6。" || return 0
+  install_packages iproute2 procps
+
+  states_backup="$(make_temp)"
+  snapshot_ipv6_disable_states > "$states_backup"
+  [[ -e "$IPV6_SYSCTL" ]] && { config_backup="$(make_temp)"; cp -a "$IPV6_SYSCTL" "$config_backup"; }
+  rm -f "$IPV6_SYSCTL"
+  apply_ipv6_enable_values
+  sleep 1
+  if ! ipv6_enable_values_verified; then
+    restore_ipv6_config "$config_backup" "$states_backup"
+    die "IPv6 恢复后的接口状态验证失败，已恢复操作前配置。" 6
+  fi
+  state_delete IPV6_DISABLED
+  (( use_snapshot == 0 )) || rm -f "$IPV6_SNAPSHOT"
+  if (( use_snapshot == 1 )); then
+    log_ok "已按关闭前快照恢复 IPv6 接口状态。公网 IPv6 地址仍取决于云厂商和网络配置。"
+  else
+    log_ok "已启用所有现有接口的 IPv6。公网 IPv6 地址仍取决于云厂商和网络配置。"
+  fi
+  show_ipv6_status
+}
+
+configure_ipv6() {
+  disable_ipv6
 }
 
 configure_llmnr() {
@@ -1304,6 +1527,9 @@ show_help() {
   vpsinit version
   vpsinit system
   vpsinit system ipv6
+  vpsinit system ipv6-status
+  vpsinit system ipv6-enable
+  vpsinit system ipv6-disable
   vpsinit system ufw-status
   vpsinit xray install|upgrade|configure|uninstall|status|logs
   vpsinit self-update
@@ -1360,7 +1586,7 @@ main() {
   ensure_base_dirs
   start_logging
   case "${1:-}:${2:-}" in
-    xray:status|xray:logs|system:ufw-status) ;;
+    xray:status|xray:logs|system:ufw-status|system:ipv6-status) ;;
     *) acquire_lock; purge_legacy_xray_client_state ;;
   esac
   case "${1:-}" in
@@ -1369,6 +1595,9 @@ main() {
       case "${2:-}" in
         '') system_wizard ;;
         ipv6) configure_ipv6 ;;
+        ipv6-status) show_ipv6_status ;;
+        ipv6-enable) enable_ipv6 ;;
+        ipv6-disable) disable_ipv6 ;;
         ufw-status) show_ufw_status ;;
         *) show_help; exit 2 ;;
       esac

@@ -80,16 +80,39 @@ unset -f check_reality_target
 unset -f xray openssl
 
 ORIGINAL_IPV6_CONF_DIR="$IPV6_CONF_DIR"
+ORIGINAL_IPV6_SNAPSHOT="$IPV6_SNAPSHOT"
 IPV6_CONF_DIR="$RUNTIME_DIR/ipv6-conf"
+IPV6_SNAPSHOT="$RUNTIME_DIR/ipv6-before-disable.conf"
 mkdir -p "$IPV6_CONF_DIR"/{all,default,eth0,lo}
 printf '1\n' > "$IPV6_CONF_DIR/all/disable_ipv6"
 printf '1\n' > "$IPV6_CONF_DIR/default/disable_ipv6"
 printf '0\n' > "$IPV6_CONF_DIR/eth0/disable_ipv6"
 printf '1\n' > "$IPV6_CONF_DIR/lo/disable_ipv6"
 [[ "$(ipv6_enabled_interfaces)" == eth0 ]] || fail 'enabled IPv6 interface was not detected'
-IPV6_SNAPSHOT="$(snapshot_ipv6_disable_states)"
-grep -q $'^eth0\t0$' <<<"$IPV6_SNAPSHOT" || fail 'IPv6 interface state snapshot missing eth0'
+IPV6_STATE_TEXT="$(snapshot_ipv6_disable_states)"
+grep -q $'^eth0\t0$' <<<"$IPV6_STATE_TEXT" || fail 'IPv6 interface state snapshot missing eth0'
+assert_false ipv6_runtime_fully_disabled
+assert_false ipv6_all_interfaces_enabled
+cat > "$IPV6_SNAPSHOT" <<'EOF'
+# Managed by vpsinit
+# IPv6 disable-state snapshot version 1
+all	0
+default	0
+eth0	0
+lo	1
+EOF
+assert_true ipv6_snapshot_valid
+mkdir -p "$IPV6_CONF_DIR/eth1"
+printf '1\n' > "$IPV6_CONF_DIR/eth1/disable_ipv6"
+apply_ipv6_enable_values
+[[ "$(<"$IPV6_CONF_DIR/all/disable_ipv6")" == 0 ]] || fail 'IPv6 all state was not restored'
+[[ "$(<"$IPV6_CONF_DIR/default/disable_ipv6")" == 0 ]] || fail 'IPv6 default state was not restored'
+[[ "$(<"$IPV6_CONF_DIR/eth0/disable_ipv6")" == 0 ]] || fail 'IPv6 interface state was not restored'
+[[ "$(<"$IPV6_CONF_DIR/lo/disable_ipv6")" == 1 ]] || fail 'IPv6 disabled interface state was not restored'
+[[ "$(<"$IPV6_CONF_DIR/eth1/disable_ipv6")" == 0 ]] || fail 'new IPv6 interface did not use saved default state'
+assert_true ipv6_enable_values_verified
 IPV6_CONF_DIR="$ORIGINAL_IPV6_CONF_DIR"
+IPV6_SNAPSHOT="$ORIGINAL_IPV6_SNAPSHOT"
 
 JSON_TEMP="$(make_temp_json)"
 [[ "$JSON_TEMP" == *.json && -f "$JSON_TEMP" ]] || fail 'Xray temporary config does not use .json suffix'
@@ -180,9 +203,12 @@ help_output="$(show_help)"
 grep -q 'vpsinit xray install' <<<"$help_output" || fail 'help missing xray install'
 grep -q 'vpsinit system' <<<"$help_output" || fail 'help missing system'
 grep -q 'vpsinit system ipv6' <<<"$help_output" || fail 'help missing IPv6 command'
+grep -q 'vpsinit system ipv6-status' <<<"$help_output" || fail 'help missing IPv6 status command'
+grep -q 'vpsinit system ipv6-enable' <<<"$help_output" || fail 'help missing IPv6 enable command'
+grep -q 'vpsinit system ipv6-disable' <<<"$help_output" || fail 'help missing IPv6 disable command'
 grep -q 'vpsinit system ufw-status' <<<"$help_output" || fail 'help missing UFW status command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.27' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.28' ]] || fail 'version command output mismatch'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'
@@ -192,7 +218,7 @@ grep -q 'snapshot_ipv6_disable_states' "$ROOT_DIR/vpsinit.sh" || fail 'per-inter
 grep -Fq 'sysctl -p "$IPV6_SYSCTL"' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 config is not applied in isolation'
 if declare -f configure_ipv6 | grep -Fq 'sysctl --system'; then fail 'IPv6 configuration reloads unrelated sysctl files'; fi
 if declare -f restore_ipv6_config | grep -Fq 'sysctl --system'; then fail 'IPv6 rollback reloads unrelated sysctl files'; fi
-grep -Fq '未检测到公网 IPv6 地址，但 IPv6 功能仍处于开启状态。' "$ROOT_DIR/vpsinit.sh" || fail 'enabled IPv6 without a global address is not reported'
+grep -Fq 'IPv6 已启用，但没有公网 IPv6 地址。' "$ROOT_DIR/vpsinit.sh" || fail 'enabled IPv6 without a global address is not reported'
 if grep -Fq '未检测到公网 IPv6 地址，保持当前 IPv6 配置。' "$ROOT_DIR/vpsinit.sh"; then fail 'enabled IPv6 without a global address is incorrectly skipped'; fi
 grep -q 'findtime = 10m' "$ROOT_DIR/vpsinit.sh" || fail 'Fail2ban findtime mismatch'
 grep -Fq 'filter = vpsinit-sshd' "$ROOT_DIR/vpsinit.sh" || fail 'Fail2ban custom SSH filter is not enabled'
@@ -215,9 +241,16 @@ grep -Fq 'ensure_package_installed fail2ban' "$ROOT_DIR/vpsinit.sh" || fail 'Fai
 if grep -Fq 'wizard_step "是否查看 UFW 状态及出入站配置信息？"' "$ROOT_DIR/vpsinit.sh"; then fail 'UFW status remains inside hardening wizard'; fi
 grep -Fq '10. 查看 UFW 状态及出入站信息' "$ROOT_DIR/vpsinit.sh" || fail 'UFW status main-menu option missing'
 grep -Fq 'ipv6) configure_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 command dispatch missing'
+grep -Fq 'ipv6-status) show_ipv6_status' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 status command dispatch missing'
+grep -Fq 'ipv6-enable) enable_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 enable command dispatch missing'
+grep -Fq 'ipv6-disable) disable_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable command dispatch missing'
 grep -Fq 'ufw-status) show_ufw_status' "$ROOT_DIR/vpsinit.sh" || fail 'UFW status command dispatch missing'
-grep -Fq 'xray:status|xray:logs|system:ufw-status)' "$ROOT_DIR/vpsinit.sh" || fail 'UFW status command incorrectly takes mutation lock'
-if grep -Eq 'system:ipv6[^)]*\)' "$ROOT_DIR/vpsinit.sh"; then fail 'IPv6 mutation command incorrectly bypasses operation lock'; fi
+grep -Fq 'xray:status|xray:logs|system:ufw-status|system:ipv6-status)' "$ROOT_DIR/vpsinit.sh" || fail 'read-only status command incorrectly takes mutation lock'
+if grep -Eq 'system:ipv6-(enable|disable)[^)]*\)' "$ROOT_DIR/vpsinit.sh"; then fail 'IPv6 mutation command incorrectly bypasses operation lock'; fi
+grep -Fq 'show_ipv6_status' <<<"$(declare -f enable_ipv6)" || fail 'IPv6 enable does not show status first'
+grep -Fq 'show_ipv6_status' <<<"$(declare -f disable_ipv6)" || fail 'IPv6 disable does not show status first'
+grep -Fq 'save_ipv6_restore_snapshot' <<<"$(declare -f disable_ipv6)" || fail 'IPv6 disable does not save restore snapshot'
+grep -Fq '[[ ! -e "$IPV6_SYSCTL" && -z "$external" ]]' <<<"$(declare -f enable_ipv6)" || fail 'IPv6 enable can ignore persistent disable configuration'
 grep -Fq 'ufw status verbose' "$ROOT_DIR/vpsinit.sh" || fail 'UFW verbose status output missing'
 grep -Fq 'ufw show added' "$ROOT_DIR/vpsinit.sh" || fail 'UFW configured rules output missing'
 grep -Fq 'apt-get 收到 SIGKILL' "$ROOT_DIR/vpsinit.sh" || fail 'apt-get SIGKILL diagnosis missing'

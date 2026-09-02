@@ -19,7 +19,7 @@
 - SSH 高位端口，必须手动输入
 - UFW、Fail2ban、自动安全更新
 - LLMNR/5355 检查与关闭
-- 公网 IPv6 检测；检测到 IPv6 时可选择关闭，并阻止在 IPv6 SSH 会话中误操作
+- IPv6 状态检查、关闭与恢复；关闭前保存接口状态，并阻止在 IPv6 SSH 会话中误操作
 - Xray VLESS + TCP + REALITY + Vision
 - Xray UUID、REALITY 公私钥和 Short ID 均可直接回车自动生成，输入 `a` 手动指定
 - REALITY 目标域名必须手动输入，不内置默认站点
@@ -38,6 +38,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vp
 vpsinit
 vpsinit system
 vpsinit system ipv6
+vpsinit system ipv6-status
+vpsinit system ipv6-enable
+vpsinit system ipv6-disable
 vpsinit system ufw-status
 vpsinit xray install
 vpsinit xray upgrade
@@ -48,6 +51,8 @@ vpsinit xray logs
 vpsinit self-update
 vpsinit self-uninstall
 ```
+
+`vpsinit system ipv6` 进入交互式 IPv6 检测与关闭步骤。`ipv6-status` 只读显示内核参数、接口开关、地址、默认路由及相关持久化配置。`ipv6-disable` 和 `ipv6-enable` 都会先显示当前状态；关闭时保存操作前的接口状态，恢复时优先按该快照还原。旧版本关闭 IPv6 或快照不存在时，恢复命令会明确提示并统一启用现有接口。公网 IPv6 地址是否出现仍取决于云厂商分配和网络配置。
 
 Xray 默认使用 `443/tcp`。如果端口已被其他服务占用，安装流程要求手动输入其他端口，不会停止或覆盖原服务。
 

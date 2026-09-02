@@ -150,6 +150,7 @@ port 58911
 permitrootlogin yes
 passwordauthentication yes
 pubkeyauthentication yes
+kbdinteractiveauthentication no
 permitemptypasswords no
 maxauthtries 8
 logingracetime 60
@@ -158,13 +159,14 @@ allowagentforwarding no
 allowtcpforwarding yes
 EOF
 }
-assert_true validate_ssh_effective_settings 58911
+assert_true validate_ssh_effective_settings 58911 yes
 sshd() {
   cat <<'EOF'
 port 58911
-permitrootlogin yes
+permitrootlogin prohibit-password
 passwordauthentication no
 pubkeyauthentication yes
+kbdinteractiveauthentication no
 permitemptypasswords no
 maxauthtries 8
 logingracetime 60
@@ -173,7 +175,8 @@ allowagentforwarding no
 allowtcpforwarding yes
 EOF
 }
-if validate_ssh_effective_settings 58911 2>/dev/null; then fail 'SSH effective setting mismatch was accepted'; fi
+assert_true validate_ssh_effective_settings 58911 no
+if validate_ssh_effective_settings 58911 yes 2>/dev/null; then fail 'SSH effective setting mismatch was accepted'; fi
 
 UFW_CALLS="$RUNTIME_DIR/ufw-calls"
 TEST_UFW_STATE=443
@@ -228,7 +231,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.29' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.30' ]] || fail 'version command output mismatch'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'
@@ -296,6 +299,10 @@ grep -q 'MaxAuthTries 8' "$ROOT_DIR/vpsinit.sh" || fail 'SSH MaxAuthTries mismat
 grep -Fq '请粘贴一整行 root SSH 公钥' "$ROOT_DIR/vpsinit.sh" || fail 'manual root SSH key prompt missing'
 grep -Fq 'wizard_step "是否覆盖 root SSH 公钥？" y configure_root_key' "$ROOT_DIR/vpsinit.sh" || fail 'root SSH key step is not enabled by default'
 grep -Fq 'port="$(read_required_port '\''请输入新的 SSH 端口'\'')"' "$ROOT_DIR/vpsinit.sh" || fail 'SSH port still has a default value'
+grep -Fq '是否允许 root 用户使用密码登录？' "$ROOT_DIR/vpsinit.sh" || fail 'root password-login prompt missing'
+grep -Fq 'PermitRootLogin $permit_root_login' "$ROOT_DIR/vpsinit.sh" || fail 'root login policy is not configurable'
+grep -Fq 'PasswordAuthentication $password_authentication' "$ROOT_DIR/vpsinit.sh" || fail 'password authentication policy is not configurable'
+grep -Fq 'KbdInteractiveAuthentication no' "$ROOT_DIR/vpsinit.sh" || fail 'keyboard-interactive authentication is not disabled'
 grep -Fq 'UUID 获取方式 [回车：自动生成；a：手动指定]' "$ROOT_DIR/vpsinit.sh" || fail 'UUID method prompt mismatch'
 grep -Fq 'Short ID 获取方式 [回车：自动生成；a：手动指定]' "$ROOT_DIR/vpsinit.sh" || fail 'Short ID method prompt mismatch'
 [[ "$(grep -Fc '请按回车自动生成，或输入 a 手动指定。' "$ROOT_DIR/vpsinit.sh")" -eq 3 ]] || fail 'Xray credential invalid-choice prompt mismatch'

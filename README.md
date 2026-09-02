@@ -37,6 +37,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vp
 ```bash
 vpsinit
 vpsinit system
+vpsinit system ipv6
+vpsinit system ufw-status
 vpsinit xray install
 vpsinit xray upgrade
 vpsinit xray configure

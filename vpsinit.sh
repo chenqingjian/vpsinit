@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.26"
+TOOL_VERSION="0.1.27"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -1303,6 +1303,7 @@ show_help() {
   vpsinit
   vpsinit version
   vpsinit system
+  vpsinit system ipv6
   vpsinit system ufw-status
   vpsinit xray install|upgrade|configure|uninstall|status|logs
   vpsinit self-update
@@ -1367,6 +1368,7 @@ main() {
     system)
       case "${2:-}" in
         '') system_wizard ;;
+        ipv6) configure_ipv6 ;;
         ufw-status) show_ufw_status ;;
         *) show_help; exit 2 ;;
       esac

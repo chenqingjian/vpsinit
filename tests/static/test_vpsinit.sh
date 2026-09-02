@@ -179,9 +179,10 @@ unset SSH_CONNECTION
 help_output="$(show_help)"
 grep -q 'vpsinit xray install' <<<"$help_output" || fail 'help missing xray install'
 grep -q 'vpsinit system' <<<"$help_output" || fail 'help missing system'
+grep -q 'vpsinit system ipv6' <<<"$help_output" || fail 'help missing IPv6 command'
 grep -q 'vpsinit system ufw-status' <<<"$help_output" || fail 'help missing UFW status command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.26' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.27' ]] || fail 'version command output mismatch'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'
@@ -213,8 +214,10 @@ grep -Fq 'ensure_package_installed ufw' "$ROOT_DIR/vpsinit.sh" || fail 'UFW inst
 grep -Fq 'ensure_package_installed fail2ban' "$ROOT_DIR/vpsinit.sh" || fail 'Fail2ban installation does not check existing package'
 if grep -Fq 'wizard_step "是否查看 UFW 状态及出入站配置信息？"' "$ROOT_DIR/vpsinit.sh"; then fail 'UFW status remains inside hardening wizard'; fi
 grep -Fq '10. 查看 UFW 状态及出入站信息' "$ROOT_DIR/vpsinit.sh" || fail 'UFW status main-menu option missing'
+grep -Fq 'ipv6) configure_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 command dispatch missing'
 grep -Fq 'ufw-status) show_ufw_status' "$ROOT_DIR/vpsinit.sh" || fail 'UFW status command dispatch missing'
 grep -Fq 'xray:status|xray:logs|system:ufw-status)' "$ROOT_DIR/vpsinit.sh" || fail 'UFW status command incorrectly takes mutation lock'
+if grep -Eq 'system:ipv6[^)]*\)' "$ROOT_DIR/vpsinit.sh"; then fail 'IPv6 mutation command incorrectly bypasses operation lock'; fi
 grep -Fq 'ufw status verbose' "$ROOT_DIR/vpsinit.sh" || fail 'UFW verbose status output missing'
 grep -Fq 'ufw show added' "$ROOT_DIR/vpsinit.sh" || fail 'UFW configured rules output missing'
 grep -Fq 'apt-get 收到 SIGKILL' "$ROOT_DIR/vpsinit.sh" || fail 'apt-get SIGKILL diagnosis missing'

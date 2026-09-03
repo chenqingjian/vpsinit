@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.30"
+TOOL_VERSION="0.1.31"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -17,6 +17,7 @@ XRAY_INSTALLER_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/ins
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_SERVICE="xray.service"
 SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpsinit.conf"
+SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/00-vpsinit-auth.conf"
 LEGACY_SSH_DROPIN="/etc/ssh/sshd_config.d/90-vpsinit.conf"
 SSH_SOCKET_DROPIN="/etc/systemd/system/ssh.socket.d/90-vpsinit-port.conf"
 LLMNR_DROPIN="/etc/systemd/resolved.conf.d/90-vpsinit-disable-llmnr.conf"
@@ -402,9 +403,27 @@ disable_ssh_port_directives() {
 }
 
 validate_ssh_effective_settings() {
-  local expected_port="$1" allow_root_password="${2:-yes}" output key expected actual expected_root_login expected_password_auth
+  local expected_port="$1" output key expected actual
   output="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null)" || return 1
   [[ "$(printf '%s\n' "$output" | awk '$1=="port" {count++; value=$2} END {if (count==1) print value}')" == "$expected_port" ]] || return 1
+  while IFS=' ' read -r key expected; do
+    actual="$(printf '%s\n' "$output" | awk -v wanted="$key" '$1==wanted {print $2; exit}')"
+    [[ "$actual" == "$expected" ]] || {
+      log_error "SSH 最终配置不符合预期：${key}=${actual:-未设置}，期望 ${expected}。"
+      return 1
+    }
+  done <<'EOF'
+maxauthtries 8
+logingracetime 60
+x11forwarding no
+allowagentforwarding no
+allowtcpforwarding yes
+EOF
+}
+
+validate_ssh_auth_settings() {
+  local allow_root_password="$1" output actual expected_root_login expected_password_auth
+  output="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null)" || return 1
   if [[ "$allow_root_password" == yes ]]; then
     expected_root_login=yes
     expected_password_auth=yes
@@ -427,31 +446,27 @@ validate_ssh_effective_settings() {
     log_error "SSH 最终配置不符合预期：passwordauthentication=${actual:-未设置}，期望 ${expected_password_auth}。"
     return 1
   }
-  while IFS=' ' read -r key expected; do
-    actual="$(printf '%s\n' "$output" | awk -v wanted="$key" '$1==wanted {print $2; exit}')"
-    [[ "$actual" == "$expected" ]] || {
-      log_error "SSH 最终配置不符合预期：${key}=${actual:-未设置}，期望 ${expected}。"
-      return 1
-    }
-  done <<'EOF'
-pubkeyauthentication yes
-kbdinteractiveauthentication no
-permitemptypasswords no
-maxauthtries 8
-logingracetime 60
-x11forwarding no
-allowagentforwarding no
-allowtcpforwarding yes
-EOF
+  actual="$(printf '%s\n' "$output" | awk '$1=="pubkeyauthentication" {print $2; exit}')"
+  [[ "$actual" == yes ]] || { log_error "SSH 公钥认证未启用。"; return 1; }
+  actual="$(printf '%s\n' "$output" | awk '$1=="kbdinteractiveauthentication" {print $2; exit}')"
+  [[ "$actual" == no ]] || { log_error "SSH 键盘交互认证未关闭。"; return 1; }
+  actual="$(printf '%s\n' "$output" | awk '$1=="permitemptypasswords" {print $2; exit}')"
+  [[ "$actual" == no ]] || { log_error "SSH 空密码登录未关闭。"; return 1; }
 }
 
-configure_ssh() {
-  install_packages openssh-server iproute2
-  local port old_port temp socket_active=0 file value backup_dir had_dropin=0 had_legacy_dropin=0 had_socket_dropin=0 ufw_rule_added=0 index=0 configured_port_list
-  local allow_root_password=yes permit_root_login=yes password_authentication=yes confirmation
-  local -a port_files=()
-  local -a port_backups=()
-  local -a configured_ports=()
+reload_ssh_auth_policy() {
+  if systemctl is-active --quiet ssh.service; then
+    systemctl reload ssh.service
+  elif systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+    return 0
+  else
+    systemctl restart ssh.service
+  fi
+}
+
+configure_root_login_policy() {
+  local allow_root_password=yes permit_root_login=yes password_authentication=yes temp backup=""
+  install_packages openssh-server
   if ! ask_yes_no "是否允许 root 用户使用密码登录？" y; then
     allow_root_password=no
     permit_root_login=prohibit-password
@@ -459,7 +474,42 @@ configure_ssh() {
     if [[ ! -s /root/.ssh/authorized_keys ]] || ! ssh-keygen -l -f /root/.ssh/authorized_keys >/dev/null 2>&1; then
       die "禁止 root 密码登录前，必须先为 root 配置至少一个有效的 SSH 公钥。" 4
     fi
+    confirm_danger "将禁止 root 密码登录，请确认已经实际验证公钥可以登录。" || return 0
   fi
+  if [[ -e "$SSH_AUTH_DROPIN" ]] && ! grep -Fqx '# Managed by vpsinit' "$SSH_AUTH_DROPIN"; then
+    die "$SSH_AUTH_DROPIN 已存在且不属于 vpsinit。" 4
+  fi
+  [[ -e "$SSH_AUTH_DROPIN" ]] && { backup="$(make_temp)"; cp -a "$SSH_AUTH_DROPIN" "$backup"; }
+  install -d -m 0755 "$(dirname "$SSH_AUTH_DROPIN")"
+  temp="$(make_temp)"
+  cat > "$temp" <<EOF
+# Managed by vpsinit
+PermitRootLogin $permit_root_login
+PasswordAuthentication $password_authentication
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+EOF
+  install -o root -g root -m 0644 "$temp" "$SSH_AUTH_DROPIN"
+  if ! sshd -t || ! validate_ssh_auth_settings "$allow_root_password" || ! reload_ssh_auth_policy; then
+    [[ -n "$backup" ]] && install -o root -g root -m 0644 "$backup" "$SSH_AUTH_DROPIN" || rm -f "$SSH_AUTH_DROPIN"
+    sshd -t && reload_ssh_auth_policy >/dev/null 2>&1 || true
+    die "root SSH 登录策略应用失败，已恢复原配置。" 6
+  fi
+  state_set ROOT_PASSWORD_LOGIN "$([[ "$allow_root_password" == yes ]] && printf 1 || printf 0)"
+  if [[ "$allow_root_password" == yes ]]; then
+    log_ok "已允许 root 使用密码或公钥登录。"
+  else
+    log_ok "已禁止 root 使用密码登录，并保留公钥登录。"
+  fi
+}
+
+configure_ssh() {
+  install_packages openssh-server iproute2
+  local port old_port temp socket_active=0 file value backup_dir had_dropin=0 had_legacy_dropin=0 had_socket_dropin=0 ufw_rule_added=0 index=0 configured_port_list
+  local -a port_files=()
+  local -a port_backups=()
+  local -a configured_ports=()
   port="$(read_required_port '请输入新的 SSH 端口')"
   old_port="$(effective_ssh_port || true)"
   [[ "$port" == "$old_port" ]] || require_free_port "$port" || return 4
@@ -481,11 +531,7 @@ configure_ssh() {
     log_info "检测到当前 SSH 配置端口：${configured_ports[0]}，将替换为 ${port}。"
   fi
 
-  confirmation="脚本会直接切换到端口 $port 并关闭旧端口。请确认云安全组已放行新端口。"
-  if [[ "$allow_root_password" == no ]]; then
-    confirmation+=" 同时将禁止 root 密码登录，请确认已经验证公钥可以登录。"
-  fi
-  confirm_danger "$confirmation" || return 0
+  confirm_danger "脚本会直接切换到端口 $port 并关闭旧端口。请确认云安全组已放行新端口。" || return 0
   if ufw_active && ! ufw status | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"; then
     ufw allow "$port/tcp" comment 'vpsinit-ssh'
     ufw_rule_added=1
@@ -507,11 +553,6 @@ configure_ssh() {
   cat > "$temp" <<EOF
 # Managed by vpsinit
 Port $port
-PermitRootLogin $permit_root_login
-PasswordAuthentication $password_authentication
-PubkeyAuthentication yes
-KbdInteractiveAuthentication no
-PermitEmptyPasswords no
 MaxAuthTries 8
 LoginGraceTime 60
 X11Forwarding no
@@ -527,7 +568,7 @@ EOF
     [[ "$ufw_rule_added" -eq 1 ]] && ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
     die "SSH 配置检查失败，已恢复原配置。" 6
   fi
-  if ! validate_ssh_effective_settings "$port" "$allow_root_password"; then
+  if ! validate_ssh_effective_settings "$port"; then
     for index in "${!port_files[@]}"; do cp -a "${port_backups[$index]}" "${port_files[$index]}"; done
     [[ "$had_dropin" -eq 1 ]] && cp -a "$backup_dir/tool-dropin" "$SSH_DROPIN" || rm -f "$SSH_DROPIN"
     [[ "$had_legacy_dropin" -eq 1 ]] && cp -a "$backup_dir/legacy-tool-dropin" "$LEGACY_SSH_DROPIN" || rm -f "$LEGACY_SSH_DROPIN"
@@ -579,7 +620,6 @@ EOF
     die "SSH 未在新端口 $port 监听，已尝试恢复原配置。" 6
   fi
   state_set SSH_PORT "$port"
-  state_set ROOT_PASSWORD_LOGIN "$([[ "$allow_root_password" == yes ]] && printf 1 || printf 0)"
   state_set SSH_SOCKET_MODE "$socket_active"
   if ufw_active; then
     state_set UFW_SSH_PORT "$port"
@@ -1220,9 +1260,8 @@ EOF
   log_ok "LLMNR 已关闭，5355 不再监听，DNS/HTTPS 验证正常。"
 }
 
-wizard_step() {
-  local prompt="$1" default="$2" function_name="$3" rc
-  ask_yes_no "$prompt" "$default" || return 0
+run_wizard_action() {
+  local function_name="$1" rc
   set +e
   ( set -Eeuo pipefail; "$function_name" )
   rc=$?
@@ -1233,10 +1272,17 @@ wizard_step() {
   fi
 }
 
+wizard_step() {
+  local prompt="$1" default="$2" function_name="$3"
+  ask_yes_no "$prompt" "$default" || return 0
+  run_wizard_action "$function_name"
+}
+
 system_wizard() {
   wizard_step "是否更新系统？" y system_update || return
   wizard_step "是否修改 root 密码？" y configure_root_password || return
   wizard_step "是否覆盖 root SSH 公钥？" y configure_root_key || return
+  run_wizard_action configure_root_login_policy || return
   wizard_step "是否修改 SSH 端口并应用加固策略？" y configure_ssh || return
   wizard_step "是否安装并启用 UFW？" y configure_ufw || return
   wizard_step "是否安装并启用 Fail2ban？" y configure_fail2ban || return

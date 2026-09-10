@@ -9,6 +9,35 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 assert_true() { "$@" || fail "$*"; }
 assert_false() { if "$@"; then fail "unexpected success: $*"; fi; }
 
+assert_true platform_supported debian 12
+assert_true platform_supported debian 13
+assert_true platform_supported ubuntu 24.04
+assert_true platform_supported ubuntu 26.04
+assert_false platform_supported ubuntu 22.04
+assert_false platform_supported ubuntu 24.10
+assert_false platform_supported ubuntu 25.04
+assert_false platform_supported linuxmint 24.04
+[[ "$(normalize_arch x86_64)" == amd64 ]] || fail 'x86_64 normalization failed'
+[[ "$(normalize_arch amd64)" == amd64 ]] || fail 'amd64 normalization failed'
+[[ "$(normalize_arch aarch64)" == arm64 ]] || fail 'aarch64 normalization failed'
+[[ "$(normalize_arch arm64)" == arm64 ]] || fail 'arm64 normalization failed'
+assert_false normalize_arch armv7l
+SYSTEM_ID=ubuntu
+SYSTEM_ARCH=amd64
+[[ "$(distro_connectivity_host)" == archive.ubuntu.com ]] || fail 'Ubuntu connectivity host mismatch'
+SYSTEM_ARCH=arm64
+[[ "$(distro_connectivity_host)" == ports.ubuntu.com ]] || fail 'Ubuntu ARM64 connectivity host mismatch'
+[[ "$(distro_connectivity_url)" == https://ports.ubuntu.com/ubuntu-ports/ ]] || fail 'Ubuntu ARM64 connectivity URL mismatch'
+ubuntu_origins="$(unattended_origin_patterns)"
+grep -Fqx 'origin=Ubuntu,codename=${distro_codename},label=Ubuntu' <<<"$ubuntu_origins" || fail 'Ubuntu base origin mismatch'
+grep -Fqx 'origin=Ubuntu,codename=${distro_codename}-security,label=Ubuntu' <<<"$ubuntu_origins" || fail 'Ubuntu security origin mismatch'
+SYSTEM_ID=debian
+SYSTEM_ARCH=amd64
+[[ "$(distro_connectivity_host)" == deb.debian.org ]] || fail 'Debian connectivity host mismatch'
+debian_origins="$(unattended_origin_patterns)"
+grep -Fqx 'origin=Debian,codename=${distro_codename},label=Debian-Security' <<<"$debian_origins" || fail 'Debian security origin mismatch'
+grep -Fqx 'origin=Debian,codename=${distro_codename}-security,label=Debian-Security' <<<"$debian_origins" || fail 'Debian codename-security origin mismatch'
+
 assert_true valid_uuid '550e8400-e29b-41d4-a716-446655440000'
 assert_false valid_uuid 'not-a-uuid'
 assert_true valid_short_id '0123456789abcdef'
@@ -233,7 +262,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.31' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.32' ]] || fail 'version command output mismatch'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'

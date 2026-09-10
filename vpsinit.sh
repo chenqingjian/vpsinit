@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.31"
+TOOL_VERSION="0.1.32"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -31,6 +31,10 @@ GREEN=$'\033[0;32m'
 YELLOW=$'\033[0;33m'
 BLUE=$'\033[0;34m'
 NC=$'\033[0m'
+SYSTEM_ID=""
+SYSTEM_VERSION=""
+SYSTEM_LABEL=""
+SYSTEM_ARCH=""
 
 log_info() { printf '%s[信息]%s %s\n' "$BLUE" "$NC" "$*" >&2; }
 log_ok() { printf '%s[完成]%s %s\n' "$GREEN" "$NC" "$*" >&2; }
@@ -57,17 +61,70 @@ require_root() {
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 用户运行。" 3
 }
 
+ubuntu_lts_supported() {
+  local version="$1" major
+  [[ "$version" =~ ^([0-9]+)\.04$ ]] || return 1
+  major="${BASH_REMATCH[1]}"
+  (( 10#$major >= 24 && 10#$major % 2 == 0 ))
+}
+
+platform_supported() {
+  local id="$1" version="$2"
+  case "$id" in
+    debian) [[ "$version" == 12 || "$version" == 13 ]] ;;
+    ubuntu) ubuntu_lts_supported "$version" ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_arch() {
+  case "$1" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 check_platform() {
+  local ID="" VERSION_ID="" PRETTY_NAME=""
   [[ -r /etc/os-release ]] || die "无法识别操作系统。" 3
   # shellcheck disable=SC1091
   . /etc/os-release
-  [[ "${ID:-}" == "debian" ]] || die "仅支持官方 Debian。" 3
-  case "${VERSION_ID:-}" in
-    12|13) ;;
-    *) die "仅支持 Debian 12 或 Debian 13。" 3 ;;
-  esac
-  [[ "$(uname -m)" == "x86_64" ]] || die "仅支持 amd64/x86_64。" 3
+  platform_supported "${ID:-}" "${VERSION_ID:-}" \
+    || die "仅支持 Debian 12/13 或官方 Ubuntu 24.04 及后续 LTS 版本。" 3
+  SYSTEM_ARCH="$(normalize_arch "$(uname -m)" || true)"
+  [[ -n "$SYSTEM_ARCH" ]] || die "仅支持 64 位 amd64/x86_64 或 arm64/aarch64。" 3
+  SYSTEM_ID="$ID"
+  SYSTEM_VERSION="$VERSION_ID"
+  SYSTEM_LABEL="${PRETTY_NAME:-$ID $VERSION_ID}"
   command -v systemctl >/dev/null 2>&1 || die "系统必须使用 systemd。" 3
+}
+
+distro_connectivity_host() {
+  if [[ "$SYSTEM_ID" == ubuntu && "$SYSTEM_ARCH" == arm64 ]]; then
+    printf 'ports.ubuntu.com\n'
+  elif [[ "$SYSTEM_ID" == ubuntu ]]; then
+    printf 'archive.ubuntu.com\n'
+  else
+    printf 'deb.debian.org\n'
+  fi
+}
+
+distro_connectivity_url() {
+  if [[ "$SYSTEM_ID" == ubuntu && "$SYSTEM_ARCH" == arm64 ]]; then
+    printf 'https://ports.ubuntu.com/ubuntu-ports/\n'
+  elif [[ "$SYSTEM_ID" == ubuntu ]]; then
+    printf 'https://archive.ubuntu.com/ubuntu/\n'
+  else
+    printf 'https://deb.debian.org/\n'
+  fi
+}
+
+verify_ipv4_connectivity() {
+  local host url
+  host="$(distro_connectivity_host)"
+  url="$(distro_connectivity_url)"
+  getent ahostsv4 "$host" >/dev/null && curl -4fsSI --max-time 15 "$url" >/dev/null
 }
 
 ensure_base_dirs() {
@@ -313,7 +370,7 @@ ensure_package_installed() {
 }
 
 system_update() {
-  log_info "正在更新 Debian 系统。"
+  log_info "正在更新 ${SYSTEM_LABEL:-当前系统}。"
   run_apt_get update
   run_apt_get full-upgrade -y
   run_apt_get autoremove -y
@@ -860,18 +917,19 @@ disable_fail2ban() {
 }
 
 configure_unattended_upgrades() {
-  local dry_run_log rc
+  local dry_run_log rc origin_pattern
   install_packages unattended-upgrades apt-listchanges
   cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
-  cat > /etc/apt/apt.conf.d/52vpsinit-unattended-upgrades-local <<'EOF'
-Unattended-Upgrade::Origins-Pattern {
-        "origin=Debian,codename=${distro_codename},label=Debian-Security";
-};
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF
+  {
+    printf 'Unattended-Upgrade::Origins-Pattern {\n'
+    while IFS= read -r origin_pattern; do
+      printf '        "%s";\n' "$origin_pattern"
+    done < <(unattended_origin_patterns)
+    printf '};\nUnattended-Upgrade::Automatic-Reboot "false";\n'
+  } > /etc/apt/apt.conf.d/52vpsinit-unattended-upgrades-local
   dry_run_log="$(make_temp)"
   log_info "正在执行自动安全更新模拟校验，最多等待 180 秒。"
   if timeout --foreground --signal=TERM --kill-after=15s 180s unattended-upgrade --dry-run --debug >"$dry_run_log" 2>&1; then
@@ -891,6 +949,22 @@ EOF
     esac
   fi
   log_ok "自动安全更新已启用，不会自动重启。"
+}
+
+unattended_origin_patterns() {
+  case "$SYSTEM_ID" in
+    debian)
+      printf '%s\n' \
+        'origin=Debian,codename=${distro_codename},label=Debian-Security' \
+        'origin=Debian,codename=${distro_codename}-security,label=Debian-Security'
+      ;;
+    ubuntu)
+      printf '%s\n' \
+        'origin=Ubuntu,codename=${distro_codename},label=Ubuntu' \
+        'origin=Ubuntu,codename=${distro_codename}-security,label=Ubuntu'
+      ;;
+    *) die "无法确定自动安全更新的软件来源。" 3 ;;
+  esac
 }
 
 global_ipv6_addresses() {
@@ -1154,7 +1228,7 @@ EOF
     (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
     die "IPv6 关闭后的状态验证失败，已恢复原配置。" 6
   fi
-  if ! getent ahostsv4 deb.debian.org >/dev/null || ! curl -4fsSI --max-time 15 https://deb.debian.org/ >/dev/null; then
+  if ! verify_ipv4_connectivity; then
     restore_ipv6_config "$backup" "$states_backup"
     (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
     die "关闭 IPv6 后 IPv4 DNS 或 HTTPS 验证失败，已恢复原配置。" 6
@@ -1250,7 +1324,7 @@ EOF
     systemctl restart systemd-resolved
     return 6
   fi
-  if ! getent ahostsv4 deb.debian.org >/dev/null || ! curl -fsSI --max-time 15 https://deb.debian.org/ >/dev/null; then
+  if ! verify_ipv4_connectivity; then
     log_error "关闭 LLMNR 后 DNS 或 HTTPS 验证失败，正在恢复。"
     [[ -n "$backup" ]] && install -m 0644 "$backup" "$LLMNR_DROPIN" || rm -f "$LLMNR_DROPIN"
     systemctl restart systemd-resolved

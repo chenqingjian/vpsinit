@@ -1,15 +1,16 @@
 # vpsinit
 
-面向全新 Debian VPS 的两个独立中文交互式管理工具。
+面向全新 Debian 或 Ubuntu VPS 的两个独立中文交互式管理工具。
 
 ## 支持范围
 
 - 官方 Debian 12/13
-- `amd64/x86_64`
+- 官方 Ubuntu 24.04 及后续 LTS 版本
+- `amd64/x86_64` 或 64 位 `arm64/aarch64`
 - systemd
 - root 用户执行
 
-第一版本不支持 Ubuntu、ARM、Docker、无人值守模式、Komari Agent 或定期安全巡检。
+不支持 Ubuntu 衍生系统、Ubuntu 非 LTS 版本、32 位 ARM、Docker、无人值守模式、Komari Agent 或定期安全巡检。
 
 ## vpsinit
 
@@ -69,7 +70,7 @@ Xray 默认使用 `443/tcp`。如果端口已被其他服务占用，安装流�
 
 负责 Nginx、Let's Encrypt 证书和 Komari Server：
 
-- Komari 官方最新稳定版 `linux-amd64` 二进制
+- Komari 官方最新稳定版 `linux-amd64` 或 `linux-arm64` 二进制
 - Komari 默认监听 `127.0.0.1:30774`
 - Nginx固定使用 `80/443`
 - IPv6 已关闭时自动省略 Nginx 的 IPv6 监听

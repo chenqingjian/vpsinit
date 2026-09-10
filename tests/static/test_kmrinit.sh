@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT_DIR/kmrinit.sh"
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
-[[ "$TOOL_VERSION" == '0.1.4' ]] || fail 'version constant mismatch'
+[[ "$TOOL_VERSION" == '0.1.5' ]] || fail 'version constant mismatch'
 if grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' "$ROOT_DIR/kmrinit.sh"; then fail 'unbraced variable adjacent to non-ASCII text'; fi
 grep -Fq '8) self_update; restart_after_self_update ;;' "$ROOT_DIR/kmrinit.sh" || fail 'menu self-update does not restart the new script'
 grep -Fq 'flock -u 9' "$ROOT_DIR/kmrinit.sh" || fail 'menu self-update does not release the operation lock'
@@ -15,6 +15,18 @@ grep -Fq "suffix='[y/n，回车默认为n]'" "$ROOT_DIR/kmrinit.sh" || fail 'no-
 if grep -Fq "suffix='[Y/n]'" "$ROOT_DIR/kmrinit.sh" || grep -Fq "suffix='[y/N]'" "$ROOT_DIR/kmrinit.sh"; then fail 'yes/no prompt still encodes defaults with letter case'; fi
 assert_true() { "$@" || fail "$*"; }
 assert_false() { if "$@"; then fail "unexpected success: $*"; fi; }
+
+assert_true platform_supported debian 12
+assert_true platform_supported debian 13
+assert_true platform_supported ubuntu 24.04
+assert_true platform_supported ubuntu 26.04
+assert_false platform_supported ubuntu 22.04
+assert_false platform_supported ubuntu 24.10
+assert_false platform_supported ubuntu 25.04
+assert_false platform_supported pop 24.04
+[[ "$(normalize_arch x86_64)" == amd64 ]] || fail 'x86_64 normalization failed'
+[[ "$(normalize_arch aarch64)" == arm64 ]] || fail 'aarch64 normalization failed'
+assert_false normalize_arch armv7l
 
 assert_true valid_domain 'monitor.example.com'
 assert_false valid_domain 'https://monitor.example.com'
@@ -115,13 +127,18 @@ grep -q "SELF_URL=\"https://raw.githubusercontent.com/chenqingjian/vpsinit/main/
 
 release_json() {
   cat <<'JSON'
-{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[{"name":"komari-linux-amd64","browser_download_url":"https://github.com/komari-monitor/komari/releases/download/v1.2.3/komari-linux-amd64","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}
+{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[{"name":"komari-linux-amd64","browser_download_url":"https://github.com/komari-monitor/komari/releases/download/v1.2.3/komari-linux-amd64","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"name":"komari-linux-arm64","browser_download_url":"https://github.com/komari-monitor/komari/releases/download/v1.2.3/komari-linux-arm64","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}
 JSON
 }
 python3() { python "$@"; }
+SYSTEM_ARCH=amd64
 release_info="$(komari_release_info)"
 [[ "$(sed -n '1p' <<<"$release_info")" == 'v1.2.3' ]] || fail 'release tag parse failed'
 [[ "$(sed -n '2p' <<<"$release_info")" == *'/komari-linux-amd64' ]] || fail 'release asset parse failed'
 [[ "$(sed -n '3p' <<<"$release_info")" == 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ]] || fail 'release digest parse failed'
+SYSTEM_ARCH=arm64
+release_info="$(komari_release_info)"
+[[ "$(sed -n '2p' <<<"$release_info")" == *'/komari-linux-arm64' ]] || fail 'ARM64 release asset parse failed'
+[[ "$(sed -n '3p' <<<"$release_info")" == 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ]] || fail 'ARM64 release digest parse failed'
 
 printf 'PASS: kmrinit static tests\n'

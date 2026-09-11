@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.32"
+TOOL_VERSION="0.1.33"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -455,6 +455,23 @@ ssh_ports_are_single_value() {
   done
 }
 
+current_ssh_server_port() {
+  local client_ip client_port server_ip server_port
+  [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+  IFS=' ' read -r client_ip client_port server_ip server_port <<<"$SSH_CONNECTION"
+  [[ "$server_port" =~ ^[0-9]+$ ]] && (( server_port >= 1 && server_port <= 65535 )) || return 1
+  printf '%s\n' "$server_port"
+}
+
+ssh_ports_are_safe_to_migrate() {
+  local session_port value
+  ssh_ports_are_single_value "$@" && return 0
+  session_port="$(current_ssh_server_port)" || return 1
+  for value in "$@"; do
+    [[ "$value" == 22 || "$value" == "$session_port" ]] || return 1
+  done
+}
+
 disable_ssh_port_directives() {
   sed -Ei 's/^([[:space:]]*Port[[:space:]]+[0-9]+([[:space:]]*(#.*)?)?)$/# Disabled by vpsinit: \1/' "$1"
 }
@@ -563,12 +580,13 @@ EOF
 
 configure_ssh() {
   install_packages openssh-server iproute2
-  local port old_port temp socket_active=0 file value backup_dir had_dropin=0 had_legacy_dropin=0 had_socket_dropin=0 ufw_rule_added=0 index=0 configured_port_list
+  local port old_port temp socket_active=0 file value backup_dir had_dropin=0 had_legacy_dropin=0 had_socket_dropin=0 ufw_rule_added=0 index=0 configured_port_list prior_ufw_ssh_port
   local -a port_files=()
   local -a port_backups=()
   local -a configured_ports=()
   port="$(read_required_port '请输入新的 SSH 端口')"
   old_port="$(effective_ssh_port || true)"
+  prior_ufw_ssh_port="$(state_get UFW_SSH_PORT 2>/dev/null || true)"
   [[ "$port" == "$old_port" ]] || require_free_port "$port" || return 4
 
   while IFS= read -r file; do
@@ -579,13 +597,18 @@ configure_ssh() {
     port_files+=("$file")
   done < <(grep -RslE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null || true)
 
-  if ! ssh_ports_are_single_value "${configured_ports[@]}"; then
-    configured_port_list="$(printf '%s\n' "${configured_ports[@]}" | sort -nu | paste -sd ',' -)"
+  configured_port_list="$(printf '%s\n' "${configured_ports[@]}" | sed '/^$/d' | sort -nu | paste -sd ',' -)"
+  if ! ssh_ports_are_safe_to_migrate "${configured_ports[@]}"; then
     log_error "检测到多个 SSH 配置端口：${configured_port_list}，拒绝自动接管。"
+    if current_ssh_server_port >/dev/null; then
+      log_error "仅允许自动迁移端口 22 与当前 SSH 会话端口 $(current_ssh_server_port) 的组合。"
+    else
+      log_error "无法识别当前 SSH 会话端口，不能安全判断这些端口是否属于当前 SSH 服务。"
+    fi
     return 4
   fi
   if (( ${#configured_ports[@]} > 0 )); then
-    log_info "检测到当前 SSH 配置端口：${configured_ports[0]}，将替换为 ${port}。"
+    log_info "检测到当前 SSH 配置端口：${configured_port_list}，将全部替换为 ${port}。"
   fi
 
   confirm_danger "脚本会直接切换到端口 $port 并关闭旧端口。请确认云安全组已放行新端口。" || return 0
@@ -680,8 +703,8 @@ EOF
   state_set SSH_SOCKET_MODE "$socket_active"
   if ufw_active; then
     state_set UFW_SSH_PORT "$port"
-    if [[ -n "$old_port" && "$old_port" != "$port" ]]; then
-      ufw --force delete allow "$old_port/tcp" >/dev/null 2>&1 || true
+    if [[ -n "$prior_ufw_ssh_port" && "$prior_ufw_ssh_port" != "$port" ]]; then
+      ufw --force delete allow "$prior_ufw_ssh_port/tcp" >/dev/null 2>&1 || true
     fi
   fi
   log_ok "SSH 已切换到端口 ${port}。"

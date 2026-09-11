@@ -53,6 +53,17 @@ assert_false valid_ipv4 '203.0.113.999'
 assert_true ssh_ports_are_single_value 7133
 assert_true ssh_ports_are_single_value 7133 7133
 assert_false ssh_ports_are_single_value 22 7133
+SSH_CONNECTION='192.0.2.10 50000 192.0.2.20 26308'
+[[ "$(current_ssh_server_port)" == 26308 ]] || fail 'current SSH server port parse failed'
+assert_true ssh_ports_are_safe_to_migrate 22 26308
+assert_true ssh_ports_are_safe_to_migrate 22 22 26308 26308
+assert_true ssh_ports_are_safe_to_migrate 7133 7133
+assert_false ssh_ports_are_safe_to_migrate 22 26308 443
+SSH_CONNECTION='192.0.2.10 50000 192.0.2.20 58911'
+assert_false ssh_ports_are_safe_to_migrate 22 26308
+unset SSH_CONNECTION
+assert_true ssh_ports_are_safe_to_migrate 7133
+assert_false ssh_ports_are_safe_to_migrate 22 26308
 SSH_PORT_CONFIG="$RUNTIME_DIR/sshd_config"
 printf 'Port 7133\n# Port 22\nPermitRootLogin yes\n' > "$SSH_PORT_CONFIG"
 disable_ssh_port_directives "$SSH_PORT_CONFIG"
@@ -262,7 +273,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.32' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.33' ]] || fail 'version command output mismatch'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'
@@ -350,8 +361,11 @@ grep -Fq '"target": "$target:443"' "$ROOT_DIR/vpsinit.sh" || fail 'REALITY targe
 grep -Fq '"serverNames": [' "$ROOT_DIR/vpsinit.sh" || fail 'REALITY serverNames config missing'
 grep -Fq 'REALITY 密钥获取方式 [回车：自动生成；a：手动指定]' "$ROOT_DIR/vpsinit.sh" || fail 'REALITY key selection prompt mismatch'
 grep -q 'SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpsinit.conf"' "$ROOT_DIR/vpsinit.sh" || fail 'SSH drop-in priority mismatch'
-grep -Fq '检测到当前 SSH 配置端口：${configured_ports[0]}，将替换为 ${port}。' "$ROOT_DIR/vpsinit.sh" || fail 'existing random SSH port is not accepted for replacement'
+grep -Fq '检测到当前 SSH 配置端口：${configured_port_list}，将全部替换为 ${port}。' "$ROOT_DIR/vpsinit.sh" || fail 'existing SSH ports are not reported for replacement'
 grep -Fq '检测到多个 SSH 配置端口：${configured_port_list}，拒绝自动接管。' "$ROOT_DIR/vpsinit.sh" || fail 'multiple SSH port conflict guard missing'
+grep -Fq 'ssh_ports_are_safe_to_migrate "${configured_ports[@]}"' "$ROOT_DIR/vpsinit.sh" || fail 'safe SSH multi-port migration guard missing'
+grep -Fq 'prior_ufw_ssh_port="$(state_get UFW_SSH_PORT' "$ROOT_DIR/vpsinit.sh" || fail 'prior owned SSH UFW rule is not tracked'
+if grep -Fq 'delete allow "$old_port/tcp"' "$ROOT_DIR/vpsinit.sh"; then fail 'SSH migration still deletes an unowned old-port UFW rule'; fi
 grep -q 'show_xray_client "$@" >/dev/tty' "$ROOT_DIR/vpsinit.sh" || fail 'one-time Xray output is not terminal-only'
 grep -Fq '请输入客户端节点名称（用于 VLESS 分享链接和 Clash/Mihomo 节点）' "$ROOT_DIR/vpsinit.sh" || fail 'manual client node name prompt missing'
 if grep -Fq '#vpsinit' "$ROOT_DIR/vpsinit.sh" || grep -Fq -- '- name: vpsinit' "$ROOT_DIR/vpsinit.sh"; then fail 'hard-coded client node name remains'; fi

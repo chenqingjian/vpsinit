@@ -273,7 +273,8 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.33' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.34' ]] || fail 'version command output mismatch'
+grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'
@@ -292,6 +293,7 @@ grep -Fq 'journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-ses
 grep -Fq 'fail2ban-regex "$test_log" "$FAIL2BAN_SSHD_FILTER" -o ip' "$ROOT_DIR/vpsinit.sh" || fail 'Fail2ban sshd-session validation missing'
 if grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' "$ROOT_DIR/vpsinit.sh"; then fail 'unbraced variable adjacent to non-ASCII text'; fi
 grep -Fq '8) self_update; restart_after_self_update ;;' "$ROOT_DIR/vpsinit.sh" || fail 'menu self-update does not restart the new script'
+grep -Fq 'update|self-update) self_update ;;' "$ROOT_DIR/vpsinit.sh" || fail 'update command alias missing'
 grep -Fq 'flock -u 9' "$ROOT_DIR/vpsinit.sh" || fail 'menu self-update does not release the operation lock'
 grep -Fq 'timeout --foreground --signal=TERM --kill-after=15s 180s unattended-upgrade --dry-run --debug' "$ROOT_DIR/vpsinit.sh" || fail 'unattended-upgrade dry-run timeout missing'
 grep -Fq '自动安全更新模拟校验超过 180 秒' "$ROOT_DIR/vpsinit.sh" || fail 'unattended-upgrade timeout warning missing'

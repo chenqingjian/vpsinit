@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.33"
+TOOL_VERSION="0.1.34"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -1867,7 +1867,7 @@ show_help() {
   vpsinit system fail2ban-enable
   vpsinit system fail2ban-disable
   vpsinit xray install|upgrade|configure|uninstall|status|logs
-  vpsinit self-update
+  vpsinit update|self-update
   vpsinit self-uninstall
 EOF
 }
@@ -1950,7 +1950,7 @@ main() {
         uninstall) xray_uninstall ;; status) xray_status ;; logs) xray_logs ;;
         *) show_help; exit 2 ;;
       esac ;;
-    self-update) self_update ;;
+    update|self-update) self_update ;;
     self-uninstall) self_uninstall ;;
     *) show_help; exit 2 ;;
   esac

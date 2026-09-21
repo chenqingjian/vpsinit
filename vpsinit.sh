@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.34"
+TOOL_VERSION="0.1.35"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -1102,6 +1102,16 @@ ipv6_enable_values_verified() {
   (( found == 1 ))
 }
 
+apply_ipv6_disable_values() {
+  local file found=0
+  for file in "$IPV6_CONF_DIR"/*/disable_ipv6; do
+    [[ -w "$file" ]] || continue
+    found=1
+    printf '1\n' > "$file" || return 1
+  done
+  (( found == 1 ))
+}
+
 ipv6_kernel_cmdline_disabled() {
   [[ -r /proc/cmdline ]] && grep -Eq '(^|[[:space:]])ipv6\.disable=1([[:space:]]|$)' /proc/cmdline
 }
@@ -1205,7 +1215,7 @@ restore_ipv6_config() {
 }
 
 disable_ipv6() {
-  local enabled_interfaces temp backup="" states_backup snapshot_created=0
+  local enabled_interfaces temp backup="" states_backup snapshot_created=0 package
   show_ipv6_status
   if ipv6_runtime_fully_disabled; then
     log_ok "IPv6 已处于关闭状态。"
@@ -1217,7 +1227,9 @@ disable_ipv6() {
     return 4
   fi
   confirm_danger "关闭 IPv6 会移除公网 IPv6 地址；请确认当前服务器可通过 IPv4 管理。" || return 0
-  install_packages iproute2 procps curl ca-certificates
+  for package in iproute2 procps curl ca-certificates; do
+    ensure_package_installed "$package"
+  done
   if [[ -e "$IPV6_SYSCTL" ]] && ! grep -q '^# Managed by vpsinit$' "$IPV6_SYSCTL"; then
     die "$IPV6_SYSCTL 已存在且不属于 vpsinit。" 4
   fi
@@ -1235,10 +1247,9 @@ disable_ipv6() {
 # Managed by vpsinit
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
-net/ipv6/conf/*/disable_ipv6 = 1
 EOF
   install -o root -g root -m 0644 "$temp" "$IPV6_SYSCTL"
-  if ! sysctl -p "$IPV6_SYSCTL" >/dev/null; then
+  if ! sysctl -p "$IPV6_SYSCTL" >/dev/null || ! apply_ipv6_disable_values; then
     restore_ipv6_config "$backup" "$states_backup"
     (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
     die "应用 IPv6 关闭配置失败，已恢复原配置。" 6
@@ -1261,7 +1272,7 @@ EOF
 }
 
 enable_ipv6() {
-  local external states_backup config_backup="" use_snapshot=0
+  local external states_backup config_backup="" use_snapshot=0 package
   show_ipv6_status
   external="$(ipv6_external_disable_configs)"
   if ipv6_all_interfaces_enabled \
@@ -1287,7 +1298,9 @@ enable_ipv6() {
   fi
   ask_yes_no "是否恢复本机 IPv6？" n || { log_info "保持当前 IPv6 配置。"; return 0; }
   confirm_danger "恢复 IPv6 会重新开放 IPv6 网络栈，但不保证云厂商已分配公网 IPv6。" || return 0
-  install_packages iproute2 procps
+  for package in iproute2 procps; do
+    ensure_package_installed "$package"
+  done
 
   states_backup="$(make_temp)"
   snapshot_ipv6_disable_states > "$states_backup"

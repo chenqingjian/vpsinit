@@ -279,7 +279,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.36' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.37' ]] || fail 'version command output mismatch'
 grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
@@ -287,6 +287,11 @@ grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv
 grep -q 'current_ssh_uses_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 SSH lockout check missing'
 grep -Fq 'net.ipv6.conf.*.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'systemd-sysctl per-interface IPv6 persistence missing'
 grep -Fq 'apply_ipv6_disable_values' "$ROOT_DIR/vpsinit.sh" || fail 'per-interface IPv6 disable application missing'
+grep -Fq 'After=network-online.target cloud-init-network.service' "$ROOT_DIR/vpsinit.sh" || fail 'post-network IPv6 persistence ordering missing'
+grep -Fq 'ExecStart=$IPV6_BOOT_HELPER' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 boot helper service missing'
+grep -Fq 'install_ipv6_boot_service' <<<"$(declare -f disable_ipv6)" || fail 'IPv6 disable does not install boot persistence service'
+grep -Fq 'remove_ipv6_boot_service' <<<"$(declare -f enable_ipv6)" || fail 'IPv6 enable does not remove boot persistence service'
+grep -Fq 'ipv6_disable_persistence_ready' <<<"$(declare -f disable_ipv6)" || fail 'IPv6 disabled fast path ignores persistence health'
 grep -Fq 'ensure_package_installed "$package"' <<<"$(declare -f disable_ipv6)" || fail 'IPv6 disable does not skip installed dependencies'
 if declare -f disable_ipv6 | grep -Fq 'install_packages iproute2'; then fail 'IPv6 disable still unconditionally invokes apt'; fi
 if declare -f enable_ipv6 | grep -Fq 'install_packages iproute2'; then fail 'IPv6 enable still unconditionally invokes apt'; fi

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.36"
+TOOL_VERSION="0.1.37"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -26,6 +26,9 @@ FAIL2BAN_SSHD_FILTER="/etc/fail2ban/filter.d/vpsinit-sshd.conf"
 IPV6_SYSCTL="/etc/sysctl.d/90-vpsinit-disable-ipv6.conf"
 IPV6_CONF_DIR="/proc/sys/net/ipv6/conf"
 IPV6_SNAPSHOT="$STATE_DIR/ipv6-before-disable.conf"
+IPV6_BOOT_HELPER="/usr/local/libexec/vpsinit-disable-ipv6"
+IPV6_BOOT_SERVICE="/etc/systemd/system/vpsinit-disable-ipv6.service"
+IPV6_BOOT_SERVICE_NAME="vpsinit-disable-ipv6.service"
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
 YELLOW=$'\033[0;33m'
@@ -1112,6 +1115,76 @@ apply_ipv6_disable_values() {
   (( found == 1 ))
 }
 
+ipv6_boot_files_safe() {
+  if [[ -e "$IPV6_BOOT_HELPER" ]] && ! grep -Fqx '# Managed by vpsinit' "$IPV6_BOOT_HELPER"; then
+    log_error "$IPV6_BOOT_HELPER 已存在且不属于 vpsinit。"
+    return 1
+  fi
+  if [[ -e "$IPV6_BOOT_SERVICE" ]] && ! grep -Fqx '# Managed by vpsinit' "$IPV6_BOOT_SERVICE"; then
+    log_error "$IPV6_BOOT_SERVICE 已存在且不属于 vpsinit。"
+    return 1
+  fi
+}
+
+install_ipv6_boot_service() {
+  local helper_temp unit_temp
+  ipv6_boot_files_safe || return 1
+  install -d -m 0755 "$(dirname "$IPV6_BOOT_HELPER")" "$(dirname "$IPV6_BOOT_SERVICE")"
+  helper_temp="$(make_temp)"
+  cat > "$helper_temp" <<'EOF'
+#!/bin/sh
+# Managed by vpsinit
+set -eu
+found=0
+for file in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+  [ -w "$file" ] || continue
+  found=1
+  printf '1\n' > "$file"
+done
+[ "$found" -eq 1 ]
+EOF
+  install -o root -g root -m 0755 "$helper_temp" "$IPV6_BOOT_HELPER"
+  unit_temp="$(make_temp)"
+  cat > "$unit_temp" <<EOF
+# Managed by vpsinit
+[Unit]
+Description=Enforce IPv6 disabled after network configuration
+After=network-online.target cloud-init-network.service
+Wants=network-online.target
+ConditionPathExists=$IPV6_SYSCTL
+
+[Service]
+Type=oneshot
+ExecStart=$IPV6_BOOT_HELPER
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  install -o root -g root -m 0644 "$unit_temp" "$IPV6_BOOT_SERVICE"
+  systemctl daemon-reload || return 1
+  systemctl enable "$IPV6_BOOT_SERVICE_NAME" >/dev/null || return 1
+  systemctl restart "$IPV6_BOOT_SERVICE_NAME" || return 1
+  systemctl is-active --quiet "$IPV6_BOOT_SERVICE_NAME"
+}
+
+remove_ipv6_boot_service() {
+  ipv6_boot_files_safe || return 1
+  systemctl disable --now "$IPV6_BOOT_SERVICE_NAME" >/dev/null 2>&1 || true
+  rm -f "$IPV6_BOOT_SERVICE" "$IPV6_BOOT_HELPER" || return 1
+  systemctl daemon-reload || return 1
+}
+
+ipv6_disable_persistence_ready() {
+  [[ -r "$IPV6_SYSCTL" ]] \
+    && grep -Fqx '# Managed by vpsinit' "$IPV6_SYSCTL" \
+    && grep -Fqx 'net.ipv6.conf.*.disable_ipv6 = 1' "$IPV6_SYSCTL" \
+    && [[ -x "$IPV6_BOOT_HELPER" && -r "$IPV6_BOOT_SERVICE" ]] \
+    && grep -Fqx '# Managed by vpsinit' "$IPV6_BOOT_HELPER" \
+    && grep -Fqx '# Managed by vpsinit' "$IPV6_BOOT_SERVICE" \
+    && systemctl is-enabled --quiet "$IPV6_BOOT_SERVICE_NAME"
+}
+
 ipv6_kernel_cmdline_disabled() {
   [[ -r /proc/cmdline ]] && grep -Eq '(^|[[:space:]])ipv6\.disable=1([[:space:]]|$)' /proc/cmdline
 }
@@ -1216,9 +1289,12 @@ restore_ipv6_config() {
 disable_ipv6() {
   local enabled_interfaces temp backup="" states_backup snapshot_created=0 package
   show_ipv6_status
-  if ipv6_runtime_fully_disabled; then
+  if ipv6_runtime_fully_disabled && ipv6_disable_persistence_ready; then
     log_ok "IPv6 已处于关闭状态。"
     return
+  fi
+  if ipv6_runtime_fully_disabled; then
+    log_warn "IPv6 当前已关闭，但重启后的持久化机制不完整，将重新配置。"
   fi
   ask_yes_no "是否关闭本机 IPv6？" n || { log_info "保留 IPv6。"; return 0; }
   if current_ssh_uses_ipv6; then
@@ -1232,6 +1308,7 @@ disable_ipv6() {
   if [[ -e "$IPV6_SYSCTL" ]] && ! grep -q '^# Managed by vpsinit$' "$IPV6_SYSCTL"; then
     die "$IPV6_SYSCTL 已存在且不属于 vpsinit。" 4
   fi
+  ipv6_boot_files_safe || return 4
   if [[ -e "$IPV6_SNAPSHOT" ]]; then
     ipv6_snapshot_valid || die "$IPV6_SNAPSHOT 已存在但不是有效的 vpsinit 状态快照。" 4
   else
@@ -1267,8 +1344,14 @@ EOF
     (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
     die "关闭 IPv6 后 IPv4 DNS 或 HTTPS 验证失败，已恢复原配置。" 6
   fi
+  if ! install_ipv6_boot_service; then
+    remove_ipv6_boot_service >/dev/null 2>&1 || true
+    restore_ipv6_config "$backup" "$states_backup"
+    (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
+    die "IPv6 启动持久化服务安装失败，已恢复原配置。" 6
+  fi
   state_set IPV6_DISABLED 1
-  log_ok "IPv6 已关闭，IPv4 DNS 和 HTTPS 验证正常。"
+  log_ok "IPv6 已关闭，并已配置网络初始化完成后的启动持久化服务。"
 }
 
 enable_ipv6() {
@@ -1305,11 +1388,17 @@ enable_ipv6() {
   states_backup="$(make_temp)"
   snapshot_ipv6_disable_states > "$states_backup"
   [[ -e "$IPV6_SYSCTL" ]] && { config_backup="$(make_temp)"; cp -a "$IPV6_SYSCTL" "$config_backup"; }
+  remove_ipv6_boot_service || die "无法移除 IPv6 启动持久化服务，拒绝恢复 IPv6。" 6
   rm -f "$IPV6_SYSCTL"
-  apply_ipv6_enable_values
+  if ! apply_ipv6_enable_values; then
+    restore_ipv6_config "$config_backup" "$states_backup"
+    install_ipv6_boot_service >/dev/null 2>&1 || true
+    die "IPv6 恢复后的接口状态验证失败，已恢复操作前配置。" 6
+  fi
   sleep 1
   if ! ipv6_enable_values_verified; then
     restore_ipv6_config "$config_backup" "$states_backup"
+    install_ipv6_boot_service >/dev/null 2>&1 || true
     die "IPv6 恢复后的接口状态验证失败，已恢复操作前配置。" 6
   fi
   state_delete IPV6_DISABLED

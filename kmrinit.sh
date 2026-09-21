@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.5"
+TOOL_VERSION="0.1.6"
 TOOL_NAME="kmrinit"
 INSTALL_PATH="/usr/local/sbin/kmrinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/kmrinit.sh"
@@ -416,6 +416,7 @@ server {
     listen 443 ssl http2;
 $v6_https
     server_name $domain;
+    client_max_body_size 20m;
 
     ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
@@ -444,6 +445,7 @@ server {
     listen 80;
 $v6_http
     server_name $domain;
+    client_max_body_size 20m;
 
     location / {
         proxy_pass http://127.0.0.1:$port;

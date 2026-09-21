@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT_DIR/kmrinit.sh"
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
-[[ "$TOOL_VERSION" == '0.1.5' ]] || fail 'version constant mismatch'
+[[ "$TOOL_VERSION" == '0.1.6' ]] || fail 'version constant mismatch'
 if grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' "$ROOT_DIR/kmrinit.sh"; then fail 'unbraced variable adjacent to non-ASCII text'; fi
 grep -Fq '8) self_update; restart_after_self_update ;;' "$ROOT_DIR/kmrinit.sh" || fail 'menu self-update does not restart the new script'
 grep -Fq 'flock -u 9' "$ROOT_DIR/kmrinit.sh" || fail 'menu self-update does not release the operation lock'
@@ -109,9 +109,11 @@ ln() { cp "$2" "$3"; }
 printf '1\n' > "$IPV6_DISABLE_FILE"
 write_nginx_configs monitor.example.com 30774 http
 if grep -q 'listen \[::\]' "$NGINX_SITE" "$NGINX_DEFAULT"; then fail 'IPv6 listen remained while IPv6 disabled'; fi
+[[ "$(grep -Fc 'client_max_body_size 20m;' "$NGINX_SITE")" -eq 1 ]] || fail 'HTTP Komari upload limit missing or duplicated'
 printf '0\n' > "$IPV6_DISABLE_FILE"
-write_nginx_configs monitor.example.com 30774 http
+write_nginx_configs monitor.example.com 30774 final
 grep -q 'listen \[::\]:80' "$NGINX_SITE" || fail 'IPv6 listen missing while IPv6 enabled'
+[[ "$(grep -Fc 'client_max_body_size 20m;' "$NGINX_SITE")" -eq 1 ]] || fail 'HTTPS Komari upload limit missing or duplicated'
 
 help_output="$(show_help)"
 grep -q 'kmrinit install' <<<"$help_output" || fail 'help missing install'

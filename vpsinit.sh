@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.35"
+TOOL_VERSION="0.1.36"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -1203,7 +1203,6 @@ restore_ipv6_config() {
   local backup="$1" states_backup="$2" interface value file
   if [[ -n "$backup" ]]; then
     install -o root -g root -m 0644 "$backup" "$IPV6_SYSCTL"
-    sysctl -p "$IPV6_SYSCTL" >/dev/null 2>&1 || true
   else
     rm -f "$IPV6_SYSCTL"
   fi
@@ -1247,9 +1246,10 @@ disable_ipv6() {
 # Managed by vpsinit
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.*.disable_ipv6 = 1
 EOF
   install -o root -g root -m 0644 "$temp" "$IPV6_SYSCTL"
-  if ! sysctl -p "$IPV6_SYSCTL" >/dev/null || ! apply_ipv6_disable_values; then
+  if ! apply_ipv6_disable_values; then
     restore_ipv6_config "$backup" "$states_backup"
     (( snapshot_created == 0 )) || rm -f "$IPV6_SNAPSHOT"
     die "应用 IPv6 关闭配置失败，已恢复原配置。" 6

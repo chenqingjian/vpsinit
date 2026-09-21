@@ -279,19 +279,20 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.35' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.36' ]] || fail 'version command output mismatch'
 grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
 grep -q 'net.ipv6.conf.all.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 disable setting missing'
 grep -q 'current_ssh_uses_ipv6' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 SSH lockout check missing'
-if grep -Fq 'net/ipv6/conf/*/disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh"; then fail 'procps sysctl config still contains unsupported interface glob'; fi
+grep -Fq 'net.ipv6.conf.*.disable_ipv6 = 1' "$ROOT_DIR/vpsinit.sh" || fail 'systemd-sysctl per-interface IPv6 persistence missing'
 grep -Fq 'apply_ipv6_disable_values' "$ROOT_DIR/vpsinit.sh" || fail 'per-interface IPv6 disable application missing'
 grep -Fq 'ensure_package_installed "$package"' <<<"$(declare -f disable_ipv6)" || fail 'IPv6 disable does not skip installed dependencies'
 if declare -f disable_ipv6 | grep -Fq 'install_packages iproute2'; then fail 'IPv6 disable still unconditionally invokes apt'; fi
 if declare -f enable_ipv6 | grep -Fq 'install_packages iproute2'; then fail 'IPv6 enable still unconditionally invokes apt'; fi
 grep -q 'snapshot_ipv6_disable_states' "$ROOT_DIR/vpsinit.sh" || fail 'per-interface IPv6 rollback snapshot missing'
-grep -Fq 'sysctl -p "$IPV6_SYSCTL"' "$ROOT_DIR/vpsinit.sh" || fail 'IPv6 config is not applied in isolation'
+if declare -f disable_ipv6 | grep -Fq 'sysctl -p'; then fail 'IPv6 disable still feeds a systemd-sysctl glob to procps sysctl'; fi
+if declare -f restore_ipv6_config | grep -Fq 'sysctl -p'; then fail 'IPv6 rollback still feeds a systemd-sysctl glob to procps sysctl'; fi
 if declare -f configure_ipv6 | grep -Fq 'sysctl --system'; then fail 'IPv6 configuration reloads unrelated sysctl files'; fi
 if declare -f restore_ipv6_config | grep -Fq 'sysctl --system'; then fail 'IPv6 rollback reloads unrelated sysctl files'; fi
 grep -Fq 'IPv6 已启用，但没有公网 IPv6 地址。' "$ROOT_DIR/vpsinit.sh" || fail 'enabled IPv6 without a global address is not reported'

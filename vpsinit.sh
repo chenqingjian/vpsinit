@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.40"
+TOOL_VERSION="0.1.41"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -1943,12 +1943,17 @@ prompt_node_name() {
 }
 
 urlencode() {
-  local LC_ALL=C value="$1" encoded="" char index hex
+  local LC_ALL=C value="$1" encoded="" char index byte hex
   for (( index=0; index<${#value}; index++ )); do
     char="${value:index:1}"
     case "$char" in
       [A-Za-z0-9._~-]) encoded+="$char" ;;
-      *) printf -v hex '%%%02X' "'$char"; encoded+="$hex" ;;
+      *)
+        printf -v byte '%d' "'$char"
+        # Keep the raw byte when the C locale maps it to 0xDFxx.
+        printf -v hex '%%%02X' "$((byte & 0xff))"
+        encoded+="$hex"
+        ;;
     esac
   done
   printf '%s\n' "$encoded"

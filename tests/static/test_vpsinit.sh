@@ -49,6 +49,23 @@ assert_false valid_ipv4 '203.0.113.999'
 [[ "$(printf 'Tokyo 01\n' | prompt_node_name)" == 'Tokyo 01' ]] || fail 'manual node name input failed'
 [[ "$(printf '\t\nTokyo 02\n' | prompt_node_name 2>/dev/null)" == 'Tokyo 02' ]] || fail 'node name control character validation failed'
 [[ "$(urlencode '香港 #1')" == '%E9%A6%99%E6%B8%AF%20%231' ]] || fail 'VLESS node name URL encoding failed'
+(
+  printf() {
+    local ordinal
+    if [[ "${1:-}" == -v && "${4:-}" == "'"* ]]; then
+      builtin printf -v ordinal '%d' "$4"
+      if (( (ordinal & 0xff) >= 0x80 )); then
+        builtin printf -v "$2" "$3" "$((0xdf00 | (ordinal & 0xff)))"
+        return
+      fi
+    fi
+    builtin printf "$@"
+  }
+  node_name=$'\xf0\x9f\x87\xaf\xf0\x9f\x87\xb5 \xe6\x97\xa5\xe6\x9c\xacLazyCat | BIGLOBE Mini'
+  name_fragment='%F0%9F%87%AF%F0%9F%87%B5%20%E6%97%A5%E6%9C%ACLazyCat%20%7C%20BIGLOBE%20Mini'
+  client_output="$(show_xray_client node.example 443 fixture-uuid fixture-key 0123 target.example "$node_name")"
+  [[ "$client_output" == *"&support-x25519mlkem768=true#$name_fragment"$'\n'* ]] || fail 'VLESS node name encoding leaked C locale code units'
+)
 [[ "$(yaml_double_quote 'HK: "01"')" == '"HK: \"01\""' ]] || fail 'Mihomo node name YAML quoting failed'
 assert_true ssh_ports_are_single_value 7133
 assert_true ssh_ports_are_single_value 7133 7133
@@ -285,7 +302,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.40' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.41' ]] || fail 'version command output mismatch'
 grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'

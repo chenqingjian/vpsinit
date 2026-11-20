@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.6"
+TOOL_VERSION="0.1.7"
 TOOL_NAME="kmrinit"
 INSTALL_PATH="/usr/local/sbin/kmrinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/kmrinit.sh"
@@ -21,6 +21,8 @@ NGINX_SITE="/etc/nginx/sites-available/kmrinit-komari.conf"
 NGINX_SITE_LINK="/etc/nginx/sites-enabled/kmrinit-komari.conf"
 NGINX_DEFAULT="/etc/nginx/conf.d/00-kmrinit-default.conf"
 CERT_HOOK="/etc/letsencrypt/renewal-hooks/deploy/90-kmrinit-reload-nginx"
+CERT_CRON="/etc/periodic/daily/kmrinit-certbot"
+ALPINE_NGINX_DEFAULT="/etc/nginx/http.d/default.conf"
 IPV6_DISABLE_FILE="/proc/sys/net/ipv6/conf/all/disable_ipv6"
 GITHUB_API_RELEASE="https://api.github.com/repos/komari-monitor/komari/releases/latest"
 
@@ -55,6 +57,7 @@ platform_supported() {
   case "$id" in
     debian) [[ "$version" == 12 || "$version" == 13 ]] ;;
     ubuntu) ubuntu_lts_supported "$version" ;;
+    alpine) [[ "$version" =~ ^3\.(23|24)(\.[0-9]+)?$ ]] ;;
     *) return 1 ;;
   esac
 }
@@ -73,13 +76,48 @@ check_platform() {
   # shellcheck disable=SC1091
   . /etc/os-release
   platform_supported "${ID:-}" "${VERSION_ID:-}" \
-    || die "仅支持 Debian 12/13 或官方 Ubuntu 24.04 及后续 LTS 版本。" 3
+    || die "仅支持 Debian 12/13、官方 Ubuntu 24.04 及后续 LTS 或 Alpine 3.23/3.24。" 3
   SYSTEM_ARCH="$(normalize_arch "$(uname -m)" || true)"
   [[ -n "$SYSTEM_ARCH" ]] || die "仅支持 64 位 amd64/x86_64 或 arm64/aarch64。" 3
   SYSTEM_ID="$ID"
   SYSTEM_VERSION="$VERSION_ID"
   SYSTEM_LABEL="${PRETTY_NAME:-$ID $VERSION_ID}"
-  command -v systemctl >/dev/null 2>&1 || die "系统必须使用 systemd。" 3
+  if [[ "$SYSTEM_ID" == alpine ]]; then
+    command -v apk >/dev/null && command -v rc-service >/dev/null && command -v rc-update >/dev/null \
+      && [[ -d /run/openrc ]] || die "Alpine 必须运行 OpenRC。" 3
+    command -v flock >/dev/null || apk add cmd:flock
+    KOMARI_SERVICE_FILE="/etc/init.d/komari"
+    NGINX_SITE="/etc/nginx/kmrinit-komari.conf"
+    NGINX_SITE_LINK="/etc/nginx/http.d/kmrinit-komari.conf"
+    NGINX_DEFAULT="/etc/nginx/http.d/00-kmrinit-default.conf"
+  else
+    command -v systemctl >/dev/null 2>&1 || die "系统必须使用 systemd。" 3
+  fi
+}
+
+stack_service() {
+  if [[ "$SYSTEM_ID" != alpine ]]; then systemctl "$@"; return; fi
+  local action="${1:-}" service
+  shift
+  case "$action" in
+    daemon-reload) return 0 ;;
+    --no-pager)
+      [[ "${1:-}" != --full ]] || shift
+      stack_service "$@"; return ;;
+  esac
+  case "${1:-}" in --now|--quiet) shift ;; esac
+  service="${1%.service}"
+  case "$action" in
+    enable) rc-update add "$service" default && rc-service "$service" start ;;
+    disable)
+      [[ -x "/etc/init.d/$service" ]] || return 0
+      if rc-service "$service" status >/dev/null 2>&1; then rc-service "$service" stop || return; fi
+      if [[ -L "/etc/runlevels/default/$service" ]]; then rc-update del "$service" default; fi ;;
+    is-active) rc-service "$service" status >/dev/null ;;
+    status) rc-service "$service" status ;;
+    start|stop|restart|reload) rc-service "$service" "$action" ;;
+    *) return 2 ;;
+  esac
 }
 
 ensure_dirs() {
@@ -111,7 +149,7 @@ bootstrap_self() {
   download_file "$SELF_URL" "$temp"
   grep -q 'TOOL_NAME="kmrinit"' "$temp" || die "下载内容不是预期的 kmrinit 脚本。" 5
   bash -n "$temp" || die "下载脚本语法检查失败。" 5
-  install -o root -g root -m 0755 "$temp" "$INSTALL_PATH"
+  install -D -o root -g root -m 0755 "$temp" "$INSTALL_PATH"
   log_ok "kmrinit 已安装。"
   exec "$INSTALL_PATH" "$@"
 }
@@ -145,15 +183,24 @@ ask_yes_no() { local prompt="$1" default="${2:-n}" answer suffix; [[ "$default" 
 confirm_danger() { local answer; log_warn "$1"; read -r -p '请输入大写 YES 继续：' answer; [[ "$answer" == YES ]] || { log_warn "操作已取消。"; return 1; }; }
 
 install_dependencies() {
+  if [[ "$SYSTEM_ID" == alpine ]]; then
+    apk add nginx nginx-openrc certbot certbot-nginx openssl
+    return
+  fi
   DEBIAN_FRONTEND=noninteractive apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates nginx certbot python3-certbot-nginx dnsutils openssl iproute2 python3
 }
 
-package_is_installed() { dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii '; }
+package_is_installed() {
+  if [[ "$SYSTEM_ID" == alpine ]]; then apk info -e "$1" >/dev/null; return; fi
+  dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii '
+}
 
 missing_stack_packages() {
   local package missing=()
-  for package in nginx nginx-common nginx-core certbot python3-certbot-nginx; do
+  local -a candidates=(nginx nginx-common nginx-core certbot python3-certbot-nginx)
+  if [[ "$SYSTEM_ID" == alpine ]]; then candidates=(nginx nginx-openrc certbot certbot-nginx); fi
+  for package in "${candidates[@]}"; do
     package_is_installed "$package" || missing+=("$package")
   done
   local IFS=,
@@ -167,11 +214,19 @@ purge_added_packages() {
   local IFS=,
   read -r -a packages <<<"$value"
   for package in "${packages[@]}"; do
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y "$package" || log_warn "由 kmrinit 添加的软件包 $package 未能自动清理。"
+    if [[ "$SYSTEM_ID" == alpine ]]; then
+      apk del "$package" || log_warn "由 kmrinit 添加的软件包 $package 未能自动清理。"
+    else
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y "$package" || log_warn "由 kmrinit 添加的软件包 $package 未能自动清理。"
+    fi
   done
 }
 
 ensure_probe_dependencies() {
+  if [[ "$SYSTEM_ID" == alpine ]]; then
+    apk add curl ca-certificates bind-tools iproute2 python3
+    return
+  fi
   DEBIAN_FRONTEND=noninteractive apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates dnsutils iproute2 python3
 }
@@ -349,6 +404,23 @@ download_komari() {
 write_komari_service() {
   local port="$1" temp
   temp="$(make_temp)"
+  if [[ "$SYSTEM_ID" == alpine ]]; then
+    cat > "$temp" <<EOF
+#!/sbin/openrc-run
+# Managed by kmrinit
+description="Komari Server managed by kmrinit"
+supervisor=supervise-daemon
+command="$KOMARI_BIN"
+command_args="server -l 127.0.0.1:$port"
+directory="$KOMARI_DIR"
+output_log="$LOG_DIR/komari-service.log"
+error_log="$LOG_DIR/komari-service.log"
+respawn_delay=5
+depend() { need net; }
+EOF
+    install -o root -g root -m 0755 "$temp" "$KOMARI_SERVICE_FILE"
+    return
+  fi
   cat > "$temp" <<EOF
 [Unit]
 Description=Komari Server managed by kmrinit
@@ -370,7 +442,7 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
   install -o root -g root -m 0644 "$temp" "$KOMARI_SERVICE_FILE"
-  systemctl daemon-reload
+  stack_service daemon-reload
 }
 
 ipv6_listen_enabled() {
@@ -380,6 +452,11 @@ ipv6_listen_enabled() {
 write_nginx_configs() {
   local domain="$1" port="$2" mode="${3:-http}" default_temp site_temp
   local v6_default_http="" v6_default_https="" v6_http="" v6_https=""
+  local tls_options='    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;'
+  if [[ "$SYSTEM_ID" == alpine ]]; then
+    tls_options='    ssl_protocols TLSv1.2 TLSv1.3;'
+  fi
   if ipv6_listen_enabled; then
     v6_default_http='    listen [::]:80 default_server;'
     v6_default_https='    listen [::]:443 ssl default_server;'
@@ -420,8 +497,7 @@ $v6_https
 
     ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+$tls_options
 
     location / {
         proxy_pass http://127.0.0.1:$port;
@@ -466,7 +542,7 @@ EOF
   install -d -m 0755 "$(dirname "$NGINX_SITE")"
   install -d -m 0755 "$(dirname "$NGINX_SITE_LINK")"
   install -d -m 0755 "$(dirname "$NGINX_DEFAULT")"
-  rm -f /etc/nginx/sites-enabled/default
+  if [[ "$SYSTEM_ID" != alpine ]]; then rm -f /etc/nginx/sites-enabled/default; fi
   install -o root -g root -m 0644 "$default_temp" "$NGINX_DEFAULT"
   install -o root -g root -m 0644 "$site_temp" "$NGINX_SITE"
   ln -sfn "$NGINX_SITE" "$NGINX_SITE_LINK"
@@ -479,6 +555,26 @@ request_certificate() {
   if [[ -n "$email" ]]; then args+=(--email "$email"); else args+=(--register-unsafely-without-email); fi
   "${args[@]}"
   install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+  if [[ "$SYSTEM_ID" == alpine ]]; then
+    if [[ -e "$CERT_CRON" || -L "$CERT_CRON" ]]; then
+      grep -Fqx '# Managed by kmrinit' "$CERT_CRON" || die "$CERT_CRON 已存在且不属于 kmrinit。" 4
+    fi
+    cat > "$CERT_HOOK" <<'EOF'
+#!/bin/sh
+# Managed by kmrinit
+nginx -t && rc-service nginx reload
+EOF
+    chmod 0755 "$CERT_HOOK"
+    install -d -m 0755 "$(dirname "$CERT_CRON")"
+    cat > "$CERT_CRON" <<'EOF'
+#!/bin/sh
+# Managed by kmrinit
+/usr/bin/certbot renew --quiet
+EOF
+    chmod 0755 "$CERT_CRON"
+    stack_service enable --now crond
+    return
+  fi
   cat > "$CERT_HOOK" <<'EOF'
 #!/usr/bin/env bash
 # Managed by kmrinit
@@ -486,6 +582,12 @@ nginx -t && systemctl reload nginx
 EOF
   chmod 0755 "$CERT_HOOK"
   systemctl enable --now certbot.timer
+}
+
+remove_alpine_renewal_job() {
+  if [[ "$SYSTEM_ID" == alpine ]] && grep -Fqx '# Managed by kmrinit' "$CERT_CRON" 2>/dev/null; then
+    rm -f "$CERT_CRON"
+  fi
 }
 
 wait_for_http() {
@@ -497,17 +599,19 @@ wait_for_http() {
 cleanup_failed_install() {
   local domain="$1" cert_preexisting="$2" hook_preexisting="$3" added_packages="$4" ufw_clean=1
   log_warn "安装未完成，正在清理本次创建的 Komari/Nginx 资源。"
-  systemctl disable --now "$KOMARI_SERVICE" >/dev/null 2>&1 || true
+  stack_service disable --now "$KOMARI_SERVICE" >/dev/null 2>&1 || true
   rm -f "$KOMARI_SERVICE_FILE"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  stack_service daemon-reload >/dev/null 2>&1 || true
   if [[ "$cert_preexisting" != 1 && -n "$domain" ]] && command -v certbot >/dev/null 2>&1; then
     certbot delete --non-interactive --cert-name "$domain" >/dev/null 2>&1 || true
   fi
-  systemctl disable --now nginx >/dev/null 2>&1 || true
+  stack_service disable --now nginx >/dev/null 2>&1 || true
   rm -f "$NGINX_SITE_LINK" "$NGINX_SITE" "$NGINX_DEFAULT"
   rm -rf "$KOMARI_DIR"
   ufw_delete_web || ufw_clean=0
+  remove_alpine_renewal_job
   purge_added_packages "$added_packages"
+  restore_alpine_nginx_default
   [[ "$hook_preexisting" == 1 ]] || rm -f "$CERT_HOOK"
   if (( ufw_clean == 1 )); then rm -f "$STATE_FILE"; else log_warn "UFW 规则尚未清理，保留 kmrinit 状态以便重试。"; fi
 }
@@ -515,21 +619,24 @@ cleanup_failed_install() {
 perform_stack_install() {
   local domain="$1" public_ip="$2" port="$3" email="$4" added_packages="$5" cert_preexisting="$6" binary tag
   install_dependencies
+  if [[ "$SYSTEM_ID" == alpine && -f "$ALPINE_NGINX_DEFAULT" ]]; then
+    mv -- "$ALPINE_NGINX_DEFAULT" "${ALPINE_NGINX_DEFAULT}.kmrinit-disabled"
+  fi
   binary="$(make_temp)"; tag="$(download_komari "$binary")"
   install -d -o root -g root -m 0750 "$KOMARI_DIR"
   install -o root -g root -m 0755 "$binary" "$KOMARI_BIN"
   write_komari_service "$port"
-  systemctl enable --now "$KOMARI_SERVICE"
-  sleep 1; systemctl is-active --quiet "$KOMARI_SERVICE" || die "Komari 服务启动失败。" 6
+  stack_service enable --now "$KOMARI_SERVICE"
+  sleep 1; stack_service is-active --quiet "$KOMARI_SERVICE" || die "Komari 服务启动失败。" 6
   wait_for_http "http://127.0.0.1:$port/" || die "Komari 内部 HTTP 健康检查失败。" 6
 
   write_nginx_configs "$domain" "$port" http
-  systemctl enable --now nginx
-  systemctl restart nginx
+  stack_service enable --now nginx
+  stack_service restart nginx
   ufw_allow_web
   request_certificate "$domain" "$email"
   write_nginx_configs "$domain" "$port" final
-  nginx -t; systemctl reload nginx
+  nginx -t; stack_service reload nginx
   certbot renew --dry-run
   wait_for_http "https://$domain/" || die "Komari HTTPS 健康检查失败。" 6
 
@@ -540,6 +647,15 @@ perform_stack_install() {
 install_stack() {
   if [[ "$(state_get INSTALLED 2>/dev/null || true)" == 1 || -e "$KOMARI_SERVICE_FILE" || -e "$NGINX_SITE" ]]; then die "检测到 Komari/Nginx 已安装，请使用 upgrade、configure 或 uninstall。" 4; fi
   command -v nginx >/dev/null 2>&1 && die "检测到已有 Nginx，拒绝接管。" 4
+  if [[ "$SYSTEM_ID" == alpine ]]; then
+    local existing
+    for existing in "$ALPINE_NGINX_DEFAULT" "${ALPINE_NGINX_DEFAULT}.kmrinit-disabled" "$NGINX_SITE_LINK" "$NGINX_DEFAULT"; do
+      [[ ! -e "$existing" && ! -L "$existing" ]] || die "$existing 已存在，拒绝接管。" 4
+    done
+  fi
+  if [[ "$SYSTEM_ID" == alpine && ( -e "$CERT_CRON" || -L "$CERT_CRON" ) ]]; then
+    die "$CERT_CRON 已存在，请先检查是否有残留续期任务。" 4
+  fi
   ensure_probe_dependencies
   require_free_port 80 || die "Nginx 必须使用 80 端口。" 4
   require_free_port 443 || die "Nginx 必须使用 443 端口。请先用 vpsinit 修改 Xray 端口。" 4
@@ -567,15 +683,25 @@ install_stack() {
   log_info "请打开网页完成 Komari 管理员首次初始化。"
 }
 
+restore_alpine_nginx_default() {
+  if [[ "$SYSTEM_ID" == alpine && -f "${ALPINE_NGINX_DEFAULT}.kmrinit-disabled" && ! -e "$ALPINE_NGINX_DEFAULT" ]]; then
+    if package_is_installed nginx; then
+      mv -- "${ALPINE_NGINX_DEFAULT}.kmrinit-disabled" "$ALPINE_NGINX_DEFAULT"
+    else
+      rm -f "${ALPINE_NGINX_DEFAULT}.kmrinit-disabled"
+    fi
+  fi
+}
+
 upgrade_komari() {
   [[ "$(state_get INSTALLED 2>/dev/null || true)" == 1 && -x "$KOMARI_BIN" ]] || die "Komari 尚未由 kmrinit 安装。" 4
   local binary tag current
   binary="$(make_temp)"; tag="$(download_komari "$binary")"; current="$(state_get KOMARI_VERSION 2>/dev/null || true)"
   if [[ "$tag" == "$current" ]]; then log_ok "Komari 已是官方最新稳定版 ${tag}。"; return; fi
-  systemctl stop "$KOMARI_SERVICE"
+  stack_service stop "$KOMARI_SERVICE"
   install -o root -g root -m 0755 "$binary" "$KOMARI_BIN"
-  systemctl start "$KOMARI_SERVICE"
-  sleep 1; systemctl is-active --quiet "$KOMARI_SERVICE" || die "Komari 升级后启动失败。" 6
+  stack_service start "$KOMARI_SERVICE"
+  sleep 1; stack_service is-active --quiet "$KOMARI_SERVICE" || die "Komari 升级后启动失败。" 6
   state_set KOMARI_VERSION "$tag"
   log_ok "Komari 已直接升级到 ${tag}。"
 }
@@ -583,24 +709,24 @@ upgrade_komari() {
 perform_stack_configure() {
   local old_domain="$1" domain="$2" port="$3" email="$4" public_ip="$5" cert_preexisting="$6"
   write_komari_service "$port"
-  systemctl restart "$KOMARI_SERVICE"
+  stack_service restart "$KOMARI_SERVICE"
   sleep 1
-  systemctl is-active --quiet "$KOMARI_SERVICE" || die "Komari 新配置启动失败。" 6
+  stack_service is-active --quiet "$KOMARI_SERVICE" || die "Komari 新配置启动失败。" 6
   wait_for_http "http://127.0.0.1:$port/" || die "Komari 新端口健康检查失败。" 6
 
   if [[ "$domain" == "$old_domain" ]]; then
     write_nginx_configs "$domain" "$port" final
-    systemctl restart nginx
+    stack_service restart nginx
   else
     write_nginx_configs "$domain" "$port" http
-    systemctl restart nginx
+    stack_service restart nginx
     request_certificate "$domain" "$email"
     write_nginx_configs "$domain" "$port" final
     nginx -t
-    systemctl reload nginx
+    stack_service reload nginx
   fi
   nginx -t
-  systemctl reload nginx
+  stack_service reload nginx
   wait_for_http "https://$domain/" || die "新配置 HTTPS 健康检查失败。" 6
   state_set DOMAIN "$domain"
   state_set KOMARI_PORT "$port"
@@ -623,9 +749,9 @@ rollback_stack_configure() {
     certbot delete --non-interactive --cert-name "$new_domain" >/dev/null 2>&1 || true
   fi
   [[ "$hook_preexisting" == 1 ]] || rm -f "$CERT_HOOK"
-  systemctl daemon-reload
-  systemctl restart "$KOMARI_SERVICE" || log_error "恢复后 Komari 重启失败，请立即人工检查。"
-  nginx -t && systemctl restart nginx || log_error "恢复后 Nginx 重启失败，请立即人工检查。"
+  stack_service daemon-reload
+  stack_service restart "$KOMARI_SERVICE" || log_error "恢复后 Komari 重启失败，请立即人工检查。"
+  nginx -t && stack_service restart nginx || log_error "恢复后 Nginx 重启失败，请立即人工检查。"
 }
 
 configure_stack() {
@@ -676,7 +802,7 @@ configure_stack() {
 }
 
 managed_stack_present() {
-  [[ "$(state_get INSTALLED 2>/dev/null || true)" == 1 ]] || grep -q '^Description=Komari Server managed by kmrinit$' "$KOMARI_SERVICE_FILE" 2>/dev/null || grep -q '^# Managed by kmrinit$' "$NGINX_SITE" 2>/dev/null
+  [[ "$(state_get INSTALLED 2>/dev/null || true)" == 1 ]] || grep -Eq '^(Description=Komari Server managed by kmrinit|# Managed by kmrinit)$' "$KOMARI_SERVICE_FILE" 2>/dev/null || grep -q '^# Managed by kmrinit$' "$NGINX_SITE" 2>/dev/null
 }
 
 uninstall_stack() {
@@ -686,16 +812,18 @@ uninstall_stack() {
   domain="$(state_get DOMAIN 2>/dev/null || true)"
   cert_preexisting="$(state_get CERT_PREEXISTING 2>/dev/null || printf '0')"
   added_packages="$(state_get ADDED_PACKAGES 2>/dev/null || true)"
-  systemctl disable --now "$KOMARI_SERVICE" >/dev/null 2>&1 || true
-  rm -f "$KOMARI_SERVICE_FILE"; systemctl daemon-reload
+  stack_service disable --now "$KOMARI_SERVICE" >/dev/null 2>&1 || true
+  rm -f "$KOMARI_SERVICE_FILE"; stack_service daemon-reload
   if [[ "$cert_preexisting" != 1 && -n "$domain" ]] && command -v certbot >/dev/null 2>&1; then
     certbot delete --non-interactive --cert-name "$domain" >/dev/null 2>&1 || true
   fi
-  systemctl disable --now nginx >/dev/null 2>&1 || true
+  stack_service disable --now nginx >/dev/null 2>&1 || true
   rm -f "$NGINX_SITE_LINK" "$NGINX_SITE" "$NGINX_DEFAULT"
   rm -rf "$KOMARI_DIR"
   ufw_delete_web || ufw_clean=0
+  remove_alpine_renewal_job
   purge_added_packages "$added_packages"
+  restore_alpine_nginx_default
   rm -f "$CERT_HOOK"
   rm -rf /var/log/nginx
   if (( ufw_clean == 1 )); then
@@ -710,22 +838,33 @@ status_stack() {
   printf 'kmrinit: %s\n' "$TOOL_VERSION"
   local domain port; domain="$(state_get DOMAIN 2>/dev/null || true)"; port="$(state_get KOMARI_PORT 2>/dev/null || true)"
   printf '域名：%s\n内部端口：%s\n记录版本：%s\n' "${domain:-未安装}" "${port:-未安装}" "$(state_get KOMARI_VERSION 2>/dev/null || printf '未知')"
-  systemctl --no-pager --full status "$KOMARI_SERVICE" || true
-  systemctl --no-pager --full status nginx || true
+  stack_service --no-pager --full status "$KOMARI_SERVICE" || true
+  stack_service --no-pager --full status nginx || true
   command -v nginx >/dev/null 2>&1 && nginx -t || true
   [[ -n "$port" ]] && ss -lntup | awk -v p=":$port" 'NR==1 || $5 ~ p"$"'
   ss -lntup | awk 'NR==1 || $5 ~ /:(80|443)$/'
   [[ -n "$domain" ]] && { printf 'A 记录：\n'; dig +short A "$domain"; certbot certificates --cert-name "$domain" || true; curl -fsSI --max-time 15 "https://$domain/" | head -n 1 || true; }
-  systemctl --no-pager status certbot.timer || true
+  if [[ "$SYSTEM_ID" == alpine ]]; then
+    [[ ! -x "$CERT_CRON" ]] || stack_service status crond || true
+  else
+    systemctl --no-pager status certbot.timer || true
+  fi
   command -v ufw >/dev/null 2>&1 && ufw status || true
 }
 
-logs_nginx() { log_info "文件日志：/var/log/nginx/access.log 和 /var/log/nginx/error.log"; journalctl -u nginx --lines 100 --follow --no-pager; }
-logs_komari() { journalctl -u "$KOMARI_SERVICE" --lines 100 --follow --no-pager; }
+logs_nginx() {
+  log_info "文件日志：/var/log/nginx/access.log 和 /var/log/nginx/error.log"
+  if [[ "$SYSTEM_ID" == alpine ]]; then tail -n 100 -f /var/log/nginx/access.log /var/log/nginx/error.log
+  else journalctl -u nginx --lines 100 --follow --no-pager; fi
+}
+logs_komari() {
+  if [[ "$SYSTEM_ID" == alpine ]]; then tail -n 100 -f "$LOG_DIR/komari-service.log"
+  else journalctl -u "$KOMARI_SERVICE" --lines 100 --follow --no-pager; fi
+}
 
 self_update() {
   local temp; temp="$(make_temp)"; download_file "$SELF_URL" "$temp"; grep -q 'TOOL_NAME="kmrinit"' "$temp" || die "下载内容不正确。" 5; bash -n "$temp" || die "新版本语法检查失败。" 5
-  install -o root -g root -m 0755 "$temp" "$INSTALL_PATH"; log_ok "kmrinit 已从 main 分支更新。"
+  install -D -o root -g root -m 0755 "$temp" "$INSTALL_PATH"; log_ok "kmrinit 已从 main 分支更新。"
 }
 
 restart_after_self_update() {
@@ -780,8 +919,7 @@ EOF
 
 main() {
   if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then show_help; return; fi
-  bootstrap_self "$@"
-  require_root; check_platform; ensure_dirs; start_logging
+  require_root; check_platform; bootstrap_self "$@"; ensure_dirs; start_logging
   if [[ "${1:-}" != status && "${1:-}" != logs ]]; then acquire_lock; fi
   case "${1:-}" in
     '') main_menu ;; install) install_stack ;; upgrade) upgrade_komari ;; configure) configure_stack ;; uninstall) uninstall_stack ;; status) status_stack ;;

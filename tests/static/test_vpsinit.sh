@@ -279,7 +279,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.37' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.38' ]] || fail 'version command output mismatch'
 grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
@@ -310,6 +310,24 @@ grep -Fq 'fail2ban-regex "$test_log" "$FAIL2BAN_SSHD_FILTER" -o ip' "$ROOT_DIR/v
 if grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' "$ROOT_DIR/vpsinit.sh"; then fail 'unbraced variable adjacent to non-ASCII text'; fi
 grep -Fq '8) self_update; restart_after_self_update ;;' "$ROOT_DIR/vpsinit.sh" || fail 'menu self-update does not restart the new script'
 grep -Fq 'update|self-update) self_update ;;' "$ROOT_DIR/vpsinit.sh" || fail 'update command alias missing'
+(
+  require_root() { :; }
+  download_file() {
+    printf '%s\n' '#!/usr/bin/env bash' 'TOOL_NAME="vpsinit"' 'printf "%s\\n" "$1"' >"$2"
+  }
+  install() {
+    [[ "$1:$2:$3:$4:$5" == '-D:-o:root:-g:root' ]] || fail 'bootstrap install flags changed'
+    shift 5
+    command install -D "$@"
+  }
+  VPSINIT_SKIP_BOOTSTRAP=0
+  INSTALL_PATH="$RUNTIME_DIR/bootstrap/usr/local/sbin/vpsinit"
+  [[ "$(bootstrap_self bootstrap-ok 2>/dev/null | tail -n 1)" == bootstrap-ok ]] || fail 'first install without destination directory failed'
+  [[ -x "$INSTALL_PATH" ]] || fail 'bootstrap did not install the executable'
+  INSTALL_PATH="$RUNTIME_DIR/self-update/usr/local/sbin/vpsinit"
+  self_update >/dev/null 2>&1
+  [[ -x "$INSTALL_PATH" ]] || fail 'self-update did not create the destination directory'
+)
 grep -Fq 'flock -u 9' "$ROOT_DIR/vpsinit.sh" || fail 'menu self-update does not release the operation lock'
 grep -Fq 'timeout --foreground --signal=TERM --kill-after=15s 180s unattended-upgrade --dry-run --debug' "$ROOT_DIR/vpsinit.sh" || fail 'unattended-upgrade dry-run timeout missing'
 grep -Fq '自动安全更新模拟校验超过 180 秒' "$ROOT_DIR/vpsinit.sh" || fail 'unattended-upgrade timeout warning missing'
@@ -400,5 +418,118 @@ grep -q '"outboundTag": "block"' "$ROOT_DIR/vpsinit.sh" || fail 'Xray block rout
 grep -q '"bittorrent"' "$ROOT_DIR/vpsinit.sh" || fail 'Xray BitTorrent block rule missing'
 if grep -Eq 'state_set XRAY_(UUID|PUBLIC_KEY|SHORT_ID|TARGET|ENDPOINT)' "$ROOT_DIR/vpsinit.sh"; then fail 'Xray client data is persisted in state'; fi
 grep -q "SELF_URL=\"https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh\"" "$ROOT_DIR/vpsinit.sh" || fail 'self URL mismatch'
+
+(
+  SYSTEM_ID=alpine
+  SYSTEM_ARCH=arm64
+  assert_true platform_supported alpine 3.23.2
+  assert_true platform_supported alpine 3.24
+  assert_false platform_supported alpine 3.22.1
+  assert_false platform_supported alpine edge
+  [[ "$(distro_connectivity_host)" == dl-cdn.alpinelinux.org ]] || fail 'Alpine connectivity host mismatch'
+  [[ "$(alpine_xray_asset amd64)" == Xray-linux-64.zip ]] || fail 'Alpine x86_64 release mismatch'
+  [[ "$(alpine_xray_asset arm64)" == Xray-linux-arm64-v8a.zip ]] || fail 'Alpine ARM64 release mismatch'
+  [[ "$(xray_service_user)" == vpsinit-xray ]] || fail 'Alpine Xray must use the dedicated service account'
+  [[ "$(xray_service_name)" == xray ]] || fail 'Alpine Xray OpenRC service name mismatch'
+
+  calls="$RUNTIME_DIR/alpine-calls"
+  systemctl() { fail 'unexpected systemctl on Alpine'; }
+  apt-get() { fail 'unexpected apt-get on Alpine'; }
+  sshd() { :; }
+  apk() {
+    if [[ "$*" == $'info\n-e\nnot-installed' ]]; then return 1; fi
+    printf 'apk %s\n' "$(IFS=' '; printf '%s' "$*")" >>"$calls"
+  }
+  install_packages openssh-server iproute2
+  assert_true package_is_installed ufw
+  assert_false package_is_installed not-installed
+  system_update
+  grep -Fxq 'apk add --update-cache openssh-server-common-openrc iproute2 iproute2-ss' "$calls" || fail 'Alpine package mapping mismatch'
+  grep -Fxq 'apk upgrade --update-cache' "$calls" || fail 'Alpine upgrade not executed'
+
+  runlevels="$RUNTIME_DIR/mock-runlevels"
+  mkdir -p "$runlevels"
+  rc-service() {
+    printf 'rc-service %s %s\n' "$1" "$2" >>"$calls"
+    case "$2" in
+      status) [[ -e "$RUNTIME_DIR/$1.active" ]] ;;
+      start|restart) touch "$RUNTIME_DIR/$1.active" ;;
+      stop) rm -f "$RUNTIME_DIR/$1.active" ;;
+      reload) [[ "$1" == sshd ]] ;;
+      *) fail "unexpected rc-service action $2" ;;
+    esac
+  }
+  rc-update() {
+    local entry
+    case "$1" in
+      show)
+        for entry in "$RUNTIME_DIR/mock-runlevels/"*; do
+          if [[ -f "$entry" ]]; then cat "$entry"; fi
+        done
+        ;;
+      add) printf '%s | %s\n' "$2" "$3" >"$RUNTIME_DIR/mock-runlevels/$2" ;;
+      del) rm "$RUNTIME_DIR/mock-runlevels/$2" ;;
+      *) fail "unexpected rc-update action $1" ;;
+    esac
+  }
+  assert_false ssh_socket_enabled
+  restart_ssh_service
+  grep -Fxq 'rc-service sshd reload' "$calls" || fail 'Alpine SSH port migration stops existing sessions'
+  assert_false service_active xray
+  service_enable_now xray
+  assert_true service_enabled xray
+  assert_true service_active xray
+  service_disable_now xray
+  assert_false service_enabled xray
+  assert_false service_active xray
+
+  IPV6_SYSCTL="$RUNTIME_DIR/ipv6-sysctl"
+  IPV6_BOOT_HELPER="$RUNTIME_DIR/ipv6-helper"
+  IPV6_BOOT_SERVICE="$RUNTIME_DIR/ipv6-openrc"
+  IPV6_BOOT_SERVICE_NAME="ipv6-openrc"
+  printf '%s\n' '# Managed by vpsinit' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$IPV6_SYSCTL"
+  install() {
+    if [[ "$1" == -d ]]; then return 0; fi
+    cp "${@: -2}"
+    chmod +x "${@: -1}"
+  }
+  install_ipv6_boot_service
+  assert_true ipv6_disable_persistence_ready
+  grep -Fxq '#!/sbin/openrc-run' "$IPV6_BOOT_SERVICE" || fail 'IPv6 persistence does not use OpenRC'
+  grep -Fxq '    need net' "$IPV6_BOOT_SERVICE" || fail 'IPv6 persistence does not wait on the network'
+  remove_ipv6_boot_service
+  assert_false ipv6_disable_persistence_ready
+  [[ ! -e "$IPV6_BOOT_HELPER" && ! -e "$IPV6_BOOT_SERVICE" ]] || fail 'IPv6 persistence files not removed'
+  unset -f install
+
+  asset_url='https://github.com/XTLS/Xray-core/releases/download/v1.0.0/Xray-linux-arm64-v8a.zip'
+  printf 'synthetic release archive' >"$RUNTIME_DIR/archive-fixture"
+  fixture_digest="sha256:$(sha256sum "$RUNTIME_DIR/archive-fixture" | cut -d ' ' -f 1)"
+  download_file() {
+    case "$1" in
+      "$XRAY_RELEASE_API") printf '{}' >"$2" ;;
+      "$asset_url") cp "$RUNTIME_DIR/archive-fixture" "$2" ;;
+      *) fail "unexpected Xray URL $1" ;;
+    esac
+  }
+  jq() {
+    [[ "$3" == asset && "$4" == Xray-linux-arm64-v8a.zip ]] || fail 'incorrect Xray asset selection'
+    case "$5" in
+      *.browser_download_url) printf '%s\n' "$asset_url" ;;
+      *.digest) printf '%s\n' "$fixture_digest" ;;
+      *) fail 'unexpected jq expression' ;;
+    esac
+  }
+  unzip() {
+    printf 'xray fixture' >"$5/xray"
+    touch "$RUNTIME_DIR/extracted"
+  }
+  bundle="$(download_alpine_xray_release)"
+  [[ -s "$bundle/xray" ]] || fail 'Xray archive was not extracted after checksum verification'
+  rm "$RUNTIME_DIR/extracted"
+  fixture_digest="sha256:$(printf '%064d' 0)"
+  if (download_alpine_xray_release) >/dev/null 2>&1; then fail 'Xray accepted a corrupt release'; fi
+  [[ ! -e "$RUNTIME_DIR/extracted" ]] || fail 'Xray extracted the archive before checksum verification'
+)
 
 printf 'PASS: vpsinit static tests\n'

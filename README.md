@@ -1,13 +1,14 @@
 # vpsinit
 
-面向全新 Debian 或 Ubuntu VPS 的两个独立中文交互式管理工具。
+面向全新 VPS 的两个独立中文交互式管理工具。
 
 ## 支持范围
 
 - 官方 Debian 12/13
 - 官方 Ubuntu 24.04 及后续 LTS 版本
+- 官方 Alpine Linux 3.23/3.24（OpenRC，`vpsinit` 和 `kmrinit` 均适用）
 - `amd64/x86_64` 或 64 位 `arm64/aarch64`
-- systemd
+- Debian/Ubuntu 使用 systemd，Alpine 使用 OpenRC
 - root 用户执行
 
 不支持 Ubuntu 衍生系统、Ubuntu 非 LTS 版本、32 位 ARM、Docker、无人值守模式、Komari Agent 或定期安全巡检。
@@ -32,6 +33,10 @@
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh)
 ```
+
+Alpine 最小镜像请先运行 `apk add bash curl ca-certificates`、进入 `bash`，再执行上面的命令。安装 UFW 或 Nginx 等组件时需要按需启用该 Alpine 版本的 `community` 仓库。
+
+Alpine 上的 vpsinit 不配置自动安全更新；可用 `apk upgrade --update-cache` 手动更新。SSH 加固要求 OpenRC 的 `sshd` 服务已运行。Fail2ban 要求 syslog 将 SSH 认证消息写入 `/var/log/auth.log` 或 `/var/log/messages`。若发现由其他服务监听 5355，脚本只报告进程，不改写其配置。
 
 后续命令：
 

@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT_DIR/kmrinit.sh"
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
-[[ "$TOOL_VERSION" == '0.1.6' ]] || fail 'version constant mismatch'
+[[ "$TOOL_VERSION" == '0.1.7' ]] || fail 'version constant mismatch'
 if grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' "$ROOT_DIR/kmrinit.sh"; then fail 'unbraced variable adjacent to non-ASCII text'; fi
 grep -Fq '8) self_update; restart_after_self_update ;;' "$ROOT_DIR/kmrinit.sh" || fail 'menu self-update does not restart the new script'
 grep -Fq 'flock -u 9' "$ROOT_DIR/kmrinit.sh" || fail 'menu self-update does not release the operation lock'
@@ -20,6 +20,9 @@ assert_true platform_supported debian 12
 assert_true platform_supported debian 13
 assert_true platform_supported ubuntu 24.04
 assert_true platform_supported ubuntu 26.04
+assert_true platform_supported alpine 3.23.1
+assert_true platform_supported alpine 3.24
+assert_false platform_supported alpine 3.22
 assert_false platform_supported ubuntu 22.04
 assert_false platform_supported ubuntu 24.10
 assert_false platform_supported ubuntu 25.04
@@ -115,6 +118,21 @@ write_nginx_configs monitor.example.com 30774 final
 grep -q 'listen \[::\]:80' "$NGINX_SITE" || fail 'IPv6 listen missing while IPv6 enabled'
 [[ "$(grep -Fc 'client_max_body_size 20m;' "$NGINX_SITE")" -eq 1 ]] || fail 'HTTPS Komari upload limit missing or duplicated'
 
+(
+  SYSTEM_ID=alpine
+  rc-service() { [[ "$#" -eq 2 && "$1" == komari && ( "$2" == start || "$2" == status ) ]]; }
+  rc-update() { [[ "$#" -eq 3 && "$1" == add && "$2" == komari && "$3" == default ]]; }
+  systemctl() { fail 'unexpected systemctl on Alpine'; }
+  stack_service enable --now "$KOMARI_SERVICE"
+  stack_service --no-pager --full status "$KOMARI_SERVICE"
+  write_komari_service 30774
+  grep -Fxq '#!/sbin/openrc-run' "$KOMARI_SERVICE_FILE" || fail 'OpenRC service missing'
+  grep -Fq 'server -l 127.0.0.1:30774' "$KOMARI_SERVICE_FILE" || fail 'OpenRC loopback bind missing'
+  write_nginx_configs monitor.example.com 30774 final
+  grep -Fq 'ssl_protocols TLSv1.2 TLSv1.3;' "$NGINX_SITE" || fail 'Alpine TLS settings missing'
+  if grep -Fq 'options-ssl-nginx.conf' "$NGINX_SITE"; then fail 'Alpine Nginx requires Debian TLS include'; fi
+)
+
 help_output="$(show_help)"
 grep -q 'kmrinit install' <<<"$help_output" || fail 'help missing install'
 grep -q 'kmrinit logs nginx|komari' <<<"$help_output" || fail 'help missing logs'
@@ -142,5 +160,24 @@ SYSTEM_ARCH=arm64
 release_info="$(komari_release_info)"
 [[ "$(sed -n '2p' <<<"$release_info")" == *'/komari-linux-arm64' ]] || fail 'ARM64 release asset parse failed'
 [[ "$(sed -n '3p' <<<"$release_info")" == 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ]] || fail 'ARM64 release digest parse failed'
+
+(
+  require_root() { :; }
+  download_file() {
+    printf '%s\n' '#!/usr/bin/env bash' 'TOOL_NAME="kmrinit"' 'printf "%s\\n" "$1"' >"$2"
+  }
+  install() {
+    [[ "$1:$2:$3:$4:$5" == '-D:-o:root:-g:root' ]] || fail 'bootstrap install flags changed'
+    shift 5
+    command install -D "$@"
+  }
+  KMRINIT_SKIP_BOOTSTRAP=0
+  INSTALL_PATH="$RUNTIME_DIR/bootstrap/usr/local/sbin/kmrinit"
+  [[ "$(bootstrap_self bootstrap-ok 2>/dev/null | tail -n 1)" == bootstrap-ok ]] || fail 'first install without destination directory failed'
+  [[ -x "$INSTALL_PATH" ]] || fail 'bootstrap did not install the executable'
+  INSTALL_PATH="$RUNTIME_DIR/self-update/usr/local/sbin/kmrinit"
+  self_update >/dev/null 2>&1
+  [[ -x "$INSTALL_PATH" ]] || fail 'self-update did not create the destination directory'
+)
 
 printf 'PASS: kmrinit static tests\n'

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.37"
+TOOL_VERSION="0.1.38"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -16,6 +16,11 @@ LOCK_FILE="/run/lock/vpsinit.lock"
 XRAY_INSTALLER_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_SERVICE="xray.service"
+XRAY_OPENRC_SCRIPT="/etc/init.d/xray"
+XRAY_LOG="/var/log/xray/service.log"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_ALPINE_USER="vpsinit-xray"
+XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpsinit.conf"
 SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/00-vpsinit-auth.conf"
 LEGACY_SSH_DROPIN="/etc/ssh/sshd_config.d/90-vpsinit.conf"
@@ -76,6 +81,7 @@ platform_supported() {
   case "$id" in
     debian) [[ "$version" == 12 || "$version" == 13 ]] ;;
     ubuntu) ubuntu_lts_supported "$version" ;;
+    alpine) [[ "$version" =~ ^3\.(23|24)(\.[0-9]+)?$ ]] ;;
     *) return 1 ;;
   esac
 }
@@ -94,17 +100,82 @@ check_platform() {
   # shellcheck disable=SC1091
   . /etc/os-release
   platform_supported "${ID:-}" "${VERSION_ID:-}" \
-    || die "仅支持 Debian 12/13 或官方 Ubuntu 24.04 及后续 LTS 版本。" 3
+    || die "仅支持 Debian 12/13、官方 Ubuntu 24.04 及后续 LTS 或 Alpine 3.23/3.24。" 3
   SYSTEM_ARCH="$(normalize_arch "$(uname -m)" || true)"
   [[ -n "$SYSTEM_ARCH" ]] || die "仅支持 64 位 amd64/x86_64 或 arm64/aarch64。" 3
   SYSTEM_ID="$ID"
   SYSTEM_VERSION="$VERSION_ID"
   SYSTEM_LABEL="${PRETTY_NAME:-$ID $VERSION_ID}"
-  command -v systemctl >/dev/null 2>&1 || die "系统必须使用 systemd。" 3
+  if is_alpine; then
+    command -v rc-service >/dev/null && command -v rc-update >/dev/null \
+      && [[ -d /run/openrc ]] || die "Alpine 必须运行 OpenRC。" 3
+    IPV6_BOOT_SERVICE_NAME="vpsinit-disable-ipv6"
+    IPV6_BOOT_SERVICE="/etc/init.d/$IPV6_BOOT_SERVICE_NAME"
+  else
+    command -v systemctl >/dev/null 2>&1 || die "系统必须使用 systemd。" 3
+  fi
+}
+
+is_alpine() { [[ "$SYSTEM_ID" == alpine ]]; }
+
+service_active() {
+  if is_alpine; then rc-service "$1" status >/dev/null 2>&1; else systemctl is-active --quiet "$1"; fi
+}
+
+service_enabled() {
+  local runlevels
+  if is_alpine; then
+    runlevels="$(alpine_service_runlevels "$1")" && [[ -n "$runlevels" ]]
+  else
+    systemctl is-enabled --quiet "$1" 2>/dev/null
+  fi
+}
+
+alpine_service_runlevels() {
+  rc-update show | awk -v name="$1" '$1 == name && $2 == "|" {for (i=3; i<=NF; i++) print $i}'
+}
+
+service_restart() {
+  if is_alpine; then rc-service "$1" restart; else systemctl restart "$1"; fi
+}
+
+service_enable_now() {
+  if is_alpine; then
+    if ! service_active "$1"; then rc-service "$1" start || return; fi
+    if ! service_enabled "$1"; then rc-update add "$1" default; fi
+  else
+    systemctl enable --now "$1"
+  fi
+}
+
+service_disable_now() {
+  local runlevels runlevel
+  if is_alpine; then
+    if service_active "$1"; then rc-service "$1" stop || return; fi
+    runlevels="$(alpine_service_runlevels "$1")" || return
+    if [[ -n "$runlevels" ]]; then
+      while IFS= read -r runlevel; do
+        rc-update del "$1" "$runlevel" || return
+      done <<<"$runlevels"
+    fi
+  else
+    systemctl disable --now "$1"
+  fi
+}
+
+restart_ssh_service() {
+  # Alpine's sshd stop action terminates logged-in sessions.
+  if is_alpine; then rc-service sshd reload; else systemctl restart ssh.service; fi
+}
+
+ssh_socket_enabled() {
+  ! is_alpine && { systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket 2>/dev/null; }
 }
 
 distro_connectivity_host() {
-  if [[ "$SYSTEM_ID" == ubuntu && "$SYSTEM_ARCH" == arm64 ]]; then
+  if is_alpine; then
+    printf 'dl-cdn.alpinelinux.org\n'
+  elif [[ "$SYSTEM_ID" == ubuntu && "$SYSTEM_ARCH" == arm64 ]]; then
     printf 'ports.ubuntu.com\n'
   elif [[ "$SYSTEM_ID" == ubuntu ]]; then
     printf 'archive.ubuntu.com\n'
@@ -114,7 +185,9 @@ distro_connectivity_host() {
 }
 
 distro_connectivity_url() {
-  if [[ "$SYSTEM_ID" == ubuntu && "$SYSTEM_ARCH" == arm64 ]]; then
+  if is_alpine; then
+    printf 'https://dl-cdn.alpinelinux.org/alpine/\n'
+  elif [[ "$SYSTEM_ID" == ubuntu && "$SYSTEM_ARCH" == arm64 ]]; then
     printf 'https://ports.ubuntu.com/ubuntu-ports/\n'
   elif [[ "$SYSTEM_ID" == ubuntu ]]; then
     printf 'https://archive.ubuntu.com/ubuntu/\n'
@@ -127,7 +200,8 @@ verify_ipv4_connectivity() {
   local host url
   host="$(distro_connectivity_host)"
   url="$(distro_connectivity_url)"
-  getent ahostsv4 "$host" >/dev/null && curl -4fsSI --max-time 15 "$url" >/dev/null
+  if ! is_alpine; then getent ahostsv4 "$host" >/dev/null || return; fi
+  curl -4fsSI --max-time 15 "$url" >/dev/null
 }
 
 ensure_base_dirs() {
@@ -144,6 +218,7 @@ start_logging() {
 }
 
 acquire_lock() {
+  if is_alpine && ! command -v flock >/dev/null 2>&1; then apk add cmd:flock; fi
   install -d -m 755 "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
   flock -n 9 || die "已有另一个 vpsinit 变更操作正在运行。" 1
@@ -166,7 +241,7 @@ bootstrap_self() {
   download_file "$SELF_URL" "$temp"
   grep -q 'TOOL_NAME="vpsinit"' "$temp" || die "下载内容不是预期的 vpsinit 脚本。" 5
   bash -n "$temp" || die "下载脚本未通过 Bash 语法检查。" 5
-  install -o root -g root -m 0755 "$temp" "$INSTALL_PATH"
+  install -D -o root -g root -m 0755 "$temp" "$INSTALL_PATH"
   log_ok "vpsinit 已安装。"
   exec "$INSTALL_PATH" "$@"
 }
@@ -354,11 +429,29 @@ run_apt_get() {
 }
 
 install_packages() {
+  if is_alpine; then
+    local package
+    local -a packages=()
+    for package in "$@"; do
+      case "$package" in
+        openssh-server)
+          packages+=(openssh-server-common-openrc)
+          if ! command -v sshd >/dev/null 2>&1; then packages+=(openssh-server); fi
+          ;;
+        openssh-client) packages+=(openssh-client-default) ;;
+        iproute2) packages+=(iproute2 iproute2-ss) ;;
+        *) packages+=("$package") ;;
+      esac
+    done
+    apk add --update-cache "${packages[@]}"
+    return
+  fi
   run_apt_get update
   run_apt_get install -y "$@"
 }
 
 package_is_installed() {
+  if is_alpine; then apk info -e "$1" >/dev/null 2>&1; return; fi
   dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -qx 'install ok installed'
 }
 
@@ -374,6 +467,11 @@ ensure_package_installed() {
 
 system_update() {
   log_info "正在更新 ${SYSTEM_LABEL:-当前系统}。"
+  if is_alpine; then
+    apk upgrade --update-cache
+    log_ok "系统更新完成，不会自动重启；内核更新后请安排手动重启。"
+    return
+  fi
   run_apt_get update
   run_apt_get full-upgrade -y
   run_apt_get autoremove -y
@@ -384,6 +482,7 @@ system_update() {
 }
 
 prompt_reboot_after_hardening() {
+  if is_alpine; then return 0; fi
   [[ -f /var/run/reboot-required ]] || return 0
   log_warn "系统更新要求重启。"
   if ask_yes_no "全部系统加固步骤已完成，是否现在重启？" n; then
@@ -532,7 +631,9 @@ validate_ssh_auth_settings() {
 }
 
 reload_ssh_auth_policy() {
-  if systemctl is-active --quiet ssh.service; then
+  if is_alpine; then
+    rc-service sshd reload
+  elif systemctl is-active --quiet ssh.service; then
     systemctl reload ssh.service
   elif systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
     return 0
@@ -544,6 +645,9 @@ reload_ssh_auth_policy() {
 configure_root_login_policy() {
   local allow_root_password=yes permit_root_login=yes password_authentication=yes temp backup=""
   install_packages openssh-server
+  if is_alpine && ! service_active sshd; then
+    die "未检测到 OpenRC 管理且已启动的 sshd，保留现有登录配置。" 4
+  fi
   if ! ask_yes_no "是否允许 root 用户使用密码登录？" y; then
     allow_root_password=no
     permit_root_login=prohibit-password
@@ -583,6 +687,9 @@ EOF
 
 configure_ssh() {
   install_packages openssh-server iproute2
+  if is_alpine && ! service_active sshd; then
+    die "未检测到 OpenRC 管理且已启动的 sshd，拒绝切换 SSH 端口。" 4
+  fi
   local port old_port temp socket_active=0 file value backup_dir had_dropin=0 had_legacy_dropin=0 had_socket_dropin=0 ufw_rule_added=0 index=0 configured_port_list prior_ufw_ssh_port
   local -a port_files=()
   local -a port_backups=()
@@ -659,7 +766,7 @@ EOF
     die "SSH 最终生效配置检查失败，已恢复原配置。" 6
   fi
 
-  if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+  if ssh_socket_enabled; then
     socket_active=1
     install -d -m 0755 "$(dirname "$SSH_SOCKET_DROPIN")"
     cat > "$SSH_SOCKET_DROPIN" <<EOF
@@ -678,13 +785,13 @@ EOF
       die "ssh.socket 重启失败，已尝试恢复原配置。" 6
     fi
   else
-    if ! systemctl restart ssh.service; then
+    if ! restart_ssh_service; then
       for index in "${!port_files[@]}"; do cp -a "${port_backups[$index]}" "${port_files[$index]}"; done
       [[ "$had_dropin" -eq 1 ]] && cp -a "$backup_dir/tool-dropin" "$SSH_DROPIN" || rm -f "$SSH_DROPIN"
       [[ "$had_legacy_dropin" -eq 1 ]] && cp -a "$backup_dir/legacy-tool-dropin" "$LEGACY_SSH_DROPIN" || rm -f "$LEGACY_SSH_DROPIN"
-      systemctl restart ssh.service || true
+      restart_ssh_service || true
       [[ "$ufw_rule_added" -eq 1 ]] && ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
-      die "ssh.service 重启失败，已尝试恢复原配置。" 6
+      die "SSH 服务无法重新加载配置，已尝试恢复原配置。" 6
     fi
   fi
 
@@ -697,7 +804,7 @@ EOF
       if [[ "$had_socket_dropin" -eq 1 ]]; then cp -a "$backup_dir/socket-dropin" "$SSH_SOCKET_DROPIN"; else rm -f "$SSH_SOCKET_DROPIN"; fi
       systemctl daemon-reload; systemctl restart ssh.socket || true
     else
-      systemctl restart ssh.service || true
+      restart_ssh_service || true
     fi
     [[ "$ufw_rule_added" -eq 1 ]] && ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
     die "SSH 未在新端口 $port 监听，已尝试恢复原配置。" 6
@@ -715,6 +822,10 @@ EOF
 
 configure_ufw() {
   ensure_package_installed ufw
+  if is_alpine; then
+    ensure_package_installed ufw-openrc
+    [[ -x /etc/init.d/ufw ]] || die "未找到 UFW OpenRC 服务。" 4
+  fi
   local ssh_port
   ssh_port="$(effective_ssh_port || true)"
   [[ -n "$ssh_port" ]] || ssh_port=22
@@ -723,9 +834,18 @@ configure_ufw() {
   if ! ufw_has_allow_rule "$ssh_port"; then
     ufw allow "$ssh_port/tcp" comment 'vpsinit-ssh'
   fi
-  ufw --force enable
+  activate_ufw
   state_set UFW_SSH_PORT "$ssh_port"
   log_ok "UFW 已启用，SSH 端口为 $ssh_port/tcp。"
+}
+
+activate_ufw() {
+  if is_alpine; then
+    [[ -x /etc/init.d/ufw ]] || return 1
+    ufw --force enable && service_enable_now ufw && ufw_active
+  else
+    ufw --force enable
+  fi
 }
 
 show_ufw_status() {
@@ -769,7 +889,7 @@ enable_ufw() {
     ufw allow "$ssh_port/tcp" comment 'vpsinit-ssh'
     rule_added=1
   fi
-  if ! ufw --force enable || ! ufw_active; then
+  if ! activate_ufw || ! ufw_active; then
     (( rule_added == 0 )) || ufw --force delete allow "$ssh_port/tcp" >/dev/null 2>&1 || true
     die "UFW 启用失败；本次新增的 SSH 放行规则已尝试撤销。" 6
   fi
@@ -790,6 +910,7 @@ disable_ufw() {
   ask_yes_no "是否停用 UFW？" n || { log_info "保持 UFW 启用。"; return 0; }
   confirm_danger "停用 UFW 会停止主机防火墙过滤，现有规则会保留以供后续恢复。" || return 0
   ufw disable
+  if is_alpine; then service_disable_now ufw; fi
   ufw_active && die "UFW 停用后仍显示为 active。" 6
   log_ok "UFW 已停用，现有规则未删除。"
 }
@@ -806,15 +927,42 @@ read_range() {
   done
 }
 
+alpine_ssh_log_path() {
+  local token="vpsinit-auth-check-${BASHPID}-${RANDOM}" file attempt facility
+  facility="$(sshd -T 2>/dev/null | awk '$1 == "syslogfacility" {print tolower($2)}')" || return 1
+  [[ "$facility" =~ ^(auth|authpriv|daemon|user|local[0-7])$ ]] || return 1
+  logger -p "$facility.info" -t sshd "$token" || return 1
+  for attempt in 1 2 3; do
+    for file in /var/log/auth.log /var/log/messages; do
+      if [[ -r "$file" ]] && tail -n 200 "$file" | grep -F "$token" >/dev/null; then
+        printf '%s\n' "$file"
+        return
+      fi
+    done
+    sleep 1
+  done
+  return 1
+}
+
 configure_fail2ban() {
   ensure_package_installed fail2ban
-  local retries minutes port temp filter_temp test_log matched_ip
+  local retries minutes port temp filter_temp test_log matched_ip backend=systemd log_path=""
+  if is_alpine; then
+    ensure_package_installed fail2ban-openrc
+    ensure_package_installed nftables
+    nft list tables >/dev/null || die "无法访问 nftables，拒绝启用无法封禁的 Fail2ban。" 4
+    log_path="$(alpine_ssh_log_path)" || die "未在 /var/log/auth.log 或 /var/log/messages 中收到 SSH auth 日志。请先配置运行中的 syslog。" 4
+    backend=polling
+  fi
   retries="$(read_range '连续失败次数' 8 1 120)"
   minutes="$(read_range '封禁时间（分钟）' 10 1 120)"
   port="$(effective_ssh_port || true)"; port="${port:-22}"
 
   if [[ -e "$FAIL2BAN_SSHD_FILTER" ]] && ! grep -Fqx '# Managed by vpsinit' "$FAIL2BAN_SSHD_FILTER"; then
     die "检测到非 vpsinit 管理的 Fail2ban SSH 过滤器：${FAIL2BAN_SSHD_FILTER}，请先处理该文件。" 6
+  fi
+  if [[ -e "$FAIL2BAN_JAIL" ]] && ! grep -Fqx '# Managed by vpsinit' "$FAIL2BAN_JAIL"; then
+    die "检测到非 vpsinit 管理的 Fail2ban jail：${FAIL2BAN_JAIL}。" 4
   fi
   filter_temp="$(make_temp)"
   cat > "$filter_temp" <<'EOF'
@@ -842,16 +990,29 @@ EOF
 enabled = true
 filter = vpsinit-sshd
 port = $port
-backend = systemd
+backend = $backend
 maxretry = $retries
 findtime = 10m
 bantime = ${minutes}m
 EOF
+  if is_alpine; then
+    cat >>"$temp" <<EOF
+logpath = $log_path
+banaction = nftables-multiport
+
+[sshd-ddos]
+port = $port
+backend = polling
+logpath = $log_path
+banaction = nftables-multiport
+EOF
+  fi
   install -d -m 0755 /etc/fail2ban/jail.d
   install -o root -g root -m 0644 "$temp" "$FAIL2BAN_JAIL"
   fail2ban-client -t
-  systemctl enable --now fail2ban
-  systemctl restart fail2ban
+  service_enable_now fail2ban
+  service_restart fail2ban
+  fail2ban-client status sshd >/dev/null || die "Fail2ban sshd jail 未启动。" 6
   log_ok "Fail2ban 已启用：10 分钟内失败 $retries 次，封禁 $minutes 分钟。"
 }
 
@@ -861,12 +1022,12 @@ show_fail2ban_status() {
     return 0
   fi
   printf '\n===== Fail2ban 服务状态 =====\n'
-  if systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+  if service_enabled fail2ban; then
     printf '开机启动：已启用\n'
   else
     printf '开机启动：未启用\n'
   fi
-  if systemctl is-active --quiet fail2ban; then
+  if service_active fail2ban; then
     printf '运行状态：active\n'
     printf '\n===== Fail2ban Jail 状态 =====\n'
     fail2ban-client status || true
@@ -900,7 +1061,7 @@ enable_fail2ban() {
   if ! package_is_installed fail2ban || ! command -v fail2ban-client >/dev/null 2>&1; then
     die "当前系统未安装 Fail2ban，请先执行 vpsinit system fail2ban。" 4
   fi
-  if systemctl is-active --quiet fail2ban && systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+  if service_active fail2ban && service_enabled fail2ban; then
     log_ok "Fail2ban 已处于运行且开机启用状态。"
     return 0
   fi
@@ -914,11 +1075,17 @@ enable_fail2ban() {
   configured_port="$(fail2ban_configured_ssh_port || true)"
   [[ -n "$current_port" && "$configured_port" == "$current_port" ]] \
     || die "Fail2ban SSH 端口配置（${configured_port:-未知}）与当前 SSH 端口（${current_port:-未知}）不一致，请重新执行 vpsinit system fail2ban。" 4
+  if is_alpine; then
+    local log_path
+    nft list tables >/dev/null || die "无法访问 nftables，拒绝启用 Fail2ban。" 4
+    log_path="$(alpine_ssh_log_path)" || die "未收到 SSH auth 日志，拒绝启用 Fail2ban。" 4
+    grep -Fxq "logpath = $log_path" "$FAIL2BAN_JAIL" || die "SSH 日志路径已变化，请重新配置 Fail2ban。" 4
+  fi
   fail2ban-client -t
   ask_yes_no "是否启用 Fail2ban？" n || { log_info "保持 Fail2ban 停用。"; return 0; }
-  systemctl enable --now fail2ban
-  if ! systemctl is-active --quiet fail2ban || ! fail2ban-client status sshd >/dev/null 2>&1; then
-    systemctl disable --now fail2ban >/dev/null 2>&1 || true
+  service_enable_now fail2ban
+  if ! service_active fail2ban || ! fail2ban-client status sshd >/dev/null 2>&1; then
+    service_disable_now fail2ban >/dev/null 2>&1 || true
     die "Fail2ban 启用后服务或 sshd jail 验证失败，已重新停用服务。" 6
   fi
   log_ok "Fail2ban 已启用，sshd jail 正常运行。"
@@ -930,19 +1097,23 @@ disable_fail2ban() {
     log_warn "当前系统未安装 Fail2ban，无需停用。"
     return 0
   fi
-  if ! systemctl is-active --quiet fail2ban && ! systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+  if ! service_active fail2ban && ! service_enabled fail2ban; then
     log_ok "Fail2ban 已处于停止且未启用状态，现有配置保持不变。"
     return 0
   fi
   ask_yes_no "是否停用 Fail2ban？" n || { log_info "保持 Fail2ban 启用。"; return 0; }
-  systemctl disable --now fail2ban
-  if systemctl is-active --quiet fail2ban || systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+  service_disable_now fail2ban
+  if service_active fail2ban || service_enabled fail2ban; then
     die "Fail2ban 停用验证失败。" 6
   fi
   log_ok "Fail2ban 已停止并取消开机启动，jail 和过滤器配置未删除。"
 }
 
 configure_unattended_upgrades() {
+  if is_alpine; then
+    log_warn "Alpine 不使用 unattended-upgrades；本版本不自动安排 apk 更新，请定期手动更新。"
+    return 0
+  fi
   local dry_run_log rc origin_pattern
   install_packages unattended-upgrades apt-listchanges
   cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -1145,6 +1316,27 @@ done
 EOF
   install -o root -g root -m 0755 "$helper_temp" "$IPV6_BOOT_HELPER"
   unit_temp="$(make_temp)"
+  if is_alpine; then
+    cat > "$unit_temp" <<EOF
+#!/sbin/openrc-run
+# Managed by vpsinit
+description="Enforce IPv6 disabled after network configuration"
+depend() {
+    need net
+    after cloud-init cloud-init-local cloud-init-network cloud-config cloud-final
+    before sshd nginx xray
+}
+start() {
+    [ ! -f "$IPV6_SYSCTL" ] || "$IPV6_BOOT_HELPER"
+}
+stop() { return 0; }
+EOF
+    install -o root -g root -m 0755 "$unit_temp" "$IPV6_BOOT_SERVICE" || return 1
+    service_enable_now "$IPV6_BOOT_SERVICE_NAME" || return 1
+    service_restart "$IPV6_BOOT_SERVICE_NAME" || return 1
+    service_active "$IPV6_BOOT_SERVICE_NAME"
+    return
+  fi
   cat > "$unit_temp" <<EOF
 # Managed by vpsinit
 [Unit]
@@ -1170,19 +1362,24 @@ EOF
 
 remove_ipv6_boot_service() {
   ipv6_boot_files_safe || return 1
-  systemctl disable --now "$IPV6_BOOT_SERVICE_NAME" >/dev/null 2>&1 || true
+  if is_alpine; then
+    service_disable_now "$IPV6_BOOT_SERVICE_NAME" || return 1
+  else
+    systemctl disable --now "$IPV6_BOOT_SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
   rm -f "$IPV6_BOOT_SERVICE" "$IPV6_BOOT_HELPER" || return 1
+  if is_alpine; then return 0; fi
   systemctl daemon-reload || return 1
 }
 
 ipv6_disable_persistence_ready() {
   [[ -r "$IPV6_SYSCTL" ]] \
     && grep -Fqx '# Managed by vpsinit' "$IPV6_SYSCTL" \
-    && grep -Fqx 'net.ipv6.conf.*.disable_ipv6 = 1' "$IPV6_SYSCTL" \
+    && { is_alpine || grep -Fqx 'net.ipv6.conf.*.disable_ipv6 = 1' "$IPV6_SYSCTL"; } \
     && [[ -x "$IPV6_BOOT_HELPER" && -r "$IPV6_BOOT_SERVICE" ]] \
     && grep -Fqx '# Managed by vpsinit' "$IPV6_BOOT_HELPER" \
     && grep -Fqx '# Managed by vpsinit' "$IPV6_BOOT_SERVICE" \
-    && systemctl is-enabled --quiet "$IPV6_BOOT_SERVICE_NAME"
+    && service_enabled "$IPV6_BOOT_SERVICE_NAME"
 }
 
 ipv6_kernel_cmdline_disabled() {
@@ -1323,8 +1520,8 @@ disable_ipv6() {
 # Managed by vpsinit
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.*.disable_ipv6 = 1
 EOF
+  if ! is_alpine; then printf '%s\n' 'net.ipv6.conf.*.disable_ipv6 = 1' >>"$temp"; fi
   install -o root -g root -m 0644 "$temp" "$IPV6_SYSCTL"
   if ! apply_ipv6_disable_values; then
     restore_ipv6_config "$backup" "$states_backup"
@@ -1424,6 +1621,10 @@ configure_llmnr() {
     return
   fi
   printf '%s\n' "$listeners"
+  if is_alpine; then
+    log_error "Alpine 检测到 5355 监听；请按上面显示的进程处理，不修改 DNS 配置。"
+    return 4
+  fi
   owner="$(printf '%s\n' "$listeners" | grep -o 'users:(("[^"]*"' | head -n1 | cut -d'"' -f2 || true)"
   [[ "$owner" == "systemd-resolve" || "$owner" == "systemd-resolved" ]] || {
     log_error "5355 由未知进程 ${owner:-无法识别} 监听，拒绝盲目修改 DNS。"
@@ -1485,7 +1686,11 @@ system_wizard() {
   wizard_step "是否修改 SSH 端口并应用加固策略？" y configure_ssh || return
   wizard_step "是否安装并启用 UFW？" y configure_ufw || return
   wizard_step "是否安装并启用 Fail2ban？" y configure_fail2ban || return
-  wizard_step "是否启用自动安全更新？" y configure_unattended_upgrades || return
+  if is_alpine; then
+    configure_unattended_upgrades
+  else
+    wizard_step "是否启用自动安全更新？" y configure_unattended_upgrades || return
+  fi
   wizard_step "是否检测公网 IPv6？" y configure_ipv6 || return
   wizard_step "是否检查并关闭 LLMNR/5355？" y configure_llmnr || return
   log_ok "系统初始化向导执行结束。"
@@ -1493,6 +1698,14 @@ system_wizard() {
 }
 
 install_xray_binary() {
+  if is_alpine; then
+    install_packages curl ca-certificates openssl unzip iproute2 jq libcap-setcap runuser
+    install_alpine_xray_service
+    local release_dir
+    release_dir="$(download_alpine_xray_release)"
+    install_alpine_xray_binary "$release_dir/xray"
+    return
+  fi
   install_packages curl ca-certificates openssl unzip iproute2
   local installer
   installer="$(make_temp)"
@@ -1502,6 +1715,83 @@ install_xray_binary() {
   command -v xray >/dev/null 2>&1 || die "Xray 安装后未找到命令。" 6
 }
 
+alpine_xray_asset() {
+  case "$1" in
+    amd64) printf '%s\n' Xray-linux-64.zip ;;
+    arm64) printf '%s\n' Xray-linux-arm64-v8a.zip ;;
+    *) return 1 ;;
+  esac
+}
+
+download_alpine_xray_release() {
+  local asset release zip bundle url digest
+  asset="$(alpine_xray_asset "$SYSTEM_ARCH")" || return
+  release="$(make_temp)"
+  zip="$(make_temp)"
+  bundle="$(mktemp -d "$RUNTIME_DIR/xray.XXXXXX")"
+  download_file "$XRAY_RELEASE_API" "$release" || return
+  url="$(jq -er --arg asset "$asset" '.assets[] | select(.name == $asset) | .browser_download_url' "$release")" || return
+  digest="$(jq -er --arg asset "$asset" '.assets[] | select(.name == $asset) | .digest' "$release")" || return
+  [[ "$url" == https://github.com/XTLS/Xray-core/releases/download/*/"$asset" \
+    && "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || die "Xray 官方发行包地址或 SHA-256 校验值无效。" 5
+  download_file "$url" "$zip" || return
+  printf '%s  %s\n' "${digest#sha256:}" "$zip" | sha256sum -c - >&2 || die "Xray 发行包 SHA-256 校验失败。" 5
+  unzip -q "$zip" xray -d "$bundle" || return
+  printf '%s\n' "$bundle"
+}
+
+install_alpine_xray_binary() {
+  install -d -m 0755 "$(dirname "$XRAY_BIN")" || return
+  install -o root -g "$XRAY_ALPINE_USER" -m 0750 "$1" "$XRAY_BIN" || return
+  setcap cap_net_bind_service=+ep "$XRAY_BIN"
+}
+
+install_alpine_xray_service() {
+  local temp
+  addgroup -S "$XRAY_ALPINE_USER"
+  state_set XRAY_ALPINE_GROUP_CREATED 1
+  adduser -S -D -H -s /sbin/nologin -G "$XRAY_ALPINE_USER" "$XRAY_ALPINE_USER"
+  state_set XRAY_ALPINE_USER_CREATED 1
+  install -d -o root -g "$XRAY_ALPINE_USER" -m 0750 "$(dirname "$XRAY_LOG")"
+  touch "$XRAY_LOG"
+  chown root:"$XRAY_ALPINE_USER" "$XRAY_LOG"
+  chmod 0660 "$XRAY_LOG"
+  temp="$(make_temp)"
+  cat >"$temp" <<EOF
+#!/sbin/openrc-run
+# Managed by vpsinit
+description="Xray service"
+command="$XRAY_BIN"
+command_args="run -config $XRAY_CONFIG"
+command_user="$XRAY_ALPINE_USER:$XRAY_ALPINE_USER"
+supervisor="supervise-daemon"
+output_log="$XRAY_LOG"
+error_log="$XRAY_LOG"
+respawn_delay=3
+respawn_max=5
+respawn_period=60
+depend() {
+    need net
+}
+EOF
+  install -o root -g root -m 0755 "$temp" "$XRAY_OPENRC_SCRIPT"
+}
+
+xray_service_user() {
+  local user
+  if is_alpine; then printf '%s\n' "$XRAY_ALPINE_USER"; return; fi
+  user="$(systemctl show "$XRAY_SERVICE" -p User --value 2>/dev/null || true)"
+  printf '%s\n' "${user:-root}"
+}
+
+xray_service_name() {
+  if is_alpine; then printf '%s\n' xray; else printf '%s\n' "$XRAY_SERVICE"; fi
+}
+
+xray_managed_openrc() {
+  [[ -x "$XRAY_OPENRC_SCRIPT" ]] && grep -Fqx '# Managed by vpsinit' "$XRAY_OPENRC_SCRIPT"
+}
+
 resolve_service_group() {
   local service_user="$1" configured_group="$2" primary_group
   if [[ -n "$configured_group" ]] && getent group "$configured_group" >/dev/null 2>&1; then
@@ -1509,7 +1799,7 @@ resolve_service_group() {
     return
   fi
   primary_group="$(id -gn "$service_user" 2>/dev/null || true)"
-  [[ -n "$primary_group" ]] && getent group "$primary_group" >/dev/null 2>&1 || die "无法确定 Xray 服务用户 $service_user 的有效用户组。" 6
+  [[ -n "$primary_group" ]] || die "无法确定 Xray 服务用户 $service_user 的有效用户组。" 6
   printf '%s\n' "$primary_group"
 }
 
@@ -1581,8 +1871,8 @@ prompt_short_id() {
 
 check_reality_target() {
   local domain="$1"
-  getent ahostsv4 "$domain" >/dev/null 2>&1 || return 1
-  timeout 15 openssl s_client -connect "$domain:443" -servername "$domain" -tls1_3 -verify_return_error </dev/null 2>/dev/null | grep -q 'Verify return code: 0'
+  if ! is_alpine; then getent ahostsv4 "$domain" >/dev/null 2>&1 || return 1; fi
+  timeout 15 openssl s_client -4 -connect "$domain:443" -servername "$domain" -tls1_3 -verify_return_error </dev/null 2>/dev/null | grep 'Verify return code: 0' >/dev/null
 }
 
 prompt_target() {
@@ -1735,8 +2025,9 @@ write_xray_config() {
   }
 }
 EOF
-  service_user="$(systemctl show "$XRAY_SERVICE" -p User --value 2>/dev/null || true)"; service_user="${service_user:-root}"
-  service_group="$(systemctl show "$XRAY_SERVICE" -p Group --value 2>/dev/null || true)"
+  service_user="$(xray_service_user)"
+  service_group=""
+  if ! is_alpine; then service_group="$(systemctl show "$XRAY_SERVICE" -p Group --value 2>/dev/null || true)"; fi
   service_group="$(resolve_service_group "$service_user" "$service_group")"
   chown root:"$service_group" "$RUNTIME_DIR"
   chmod 0710 "$RUNTIME_DIR"
@@ -1788,23 +2079,52 @@ xray_config_short_id() { sed -n 's/.*"shortIds": \["\([^"]*\)"\].*/\1/p' "$XRAY_
 xray_config_target() { sed -n 's/.*"serverNames": \["\([^"]*\)"\].*/\1/p' "$XRAY_CONFIG" | head -n 1; }
 
 xray_present() {
-  command -v xray >/dev/null 2>&1 || [[ -x /usr/local/bin/xray ]] || systemctl cat "$XRAY_SERVICE" >/dev/null 2>&1 || [[ -e "$XRAY_CONFIG" ]]
+  if command -v xray >/dev/null 2>&1 || [[ -e "$XRAY_BIN" || -e "$XRAY_CONFIG" ]]; then return 0; fi
+  if is_alpine; then
+    [[ -e "$XRAY_OPENRC_SCRIPT" || -e /etc/conf.d/xray || -e /var/log/xray || -e /usr/local/etc/xray ]]
+  else
+    systemctl cat "$XRAY_SERVICE" >/dev/null 2>&1
+  fi
+}
+
+remove_alpine_xray() {
+  if [[ -e "$XRAY_OPENRC_SCRIPT" ]]; then
+    xray_managed_openrc || die "Xray OpenRC 服务不属于 vpsinit，拒绝清理。" 4
+    service_disable_now xray || die "无法停止或取消 Xray 的开机启动，未删除文件。" 6
+  fi
+  rm -f "$XRAY_OPENRC_SCRIPT" "$XRAY_BIN"
+  rm -rf /usr/local/etc/xray /var/log/xray
+  if [[ "$(state_get XRAY_ALPINE_USER_CREATED 2>/dev/null || true)" == 1 ]]; then
+    deluser "$XRAY_ALPINE_USER"
+    state_delete XRAY_ALPINE_USER_CREATED
+  fi
+  if [[ "$(state_get XRAY_ALPINE_GROUP_CREATED 2>/dev/null || true)" == 1 ]]; then
+    if grep -q "^$XRAY_ALPINE_USER:" /etc/group; then delgroup "$XRAY_ALPINE_USER"; fi
+    state_delete XRAY_ALPINE_GROUP_CREATED
+  fi
 }
 
 cleanup_failed_xray_install() {
   log_warn "Xray 安装未完成，正在清理本次创建的资源。"
-  systemctl disable --now "$XRAY_SERVICE" >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
-  rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
-  rm -f /usr/local/bin/xray
-  rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  if is_alpine; then
+    remove_alpine_xray
+  else
+    cleanup_systemd_xray
+  fi
   ufw_delete_owned XRAY || true
   state_delete XRAY_INSTALLED; state_delete XRAY_PORT; state_delete XRAY_UUID; state_delete XRAY_PUBLIC_KEY; state_delete XRAY_SHORT_ID; state_delete XRAY_TARGET; state_delete XRAY_ENDPOINT
 }
 
+cleanup_systemd_xray() {
+  systemctl disable --now "$XRAY_SERVICE" >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service "$XRAY_BIN"
+  rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 perform_xray_install() {
-  local port uuid private_key public_key short_id target endpoint node_name keys
+  local port uuid private_key public_key short_id target endpoint node_name keys service
+  service="$(xray_service_name)"
   port="$(read_free_port 'Xray 监听端口' 443)"
   uuid="$(prompt_uuid)"
   keys="$(prompt_reality_keys)"; private_key="$(printf '%s\n' "$keys" | sed -n '1p')"; public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
@@ -1813,10 +2133,10 @@ perform_xray_install() {
   endpoint="$(prompt_endpoint)"
   node_name="$(prompt_node_name)"
   write_xray_config "$port" "$uuid" "$private_key" "$short_id" "$target"
-  systemctl enable --now "$XRAY_SERVICE"
-  systemctl restart "$XRAY_SERVICE"
+  service_enable_now "$service"
+  if ! is_alpine; then service_restart "$service"; fi
   sleep 1
-  systemctl is-active --quiet "$XRAY_SERVICE" || die "Xray 服务启动失败。" 6
+  service_active "$service" || die "Xray 服务启动失败。" 6
   port_is_listening "$port" || die "Xray 未监听端口 ${port}。" 6
   ufw_allow_owned "$port" XRAY
   state_set XRAY_INSTALLED 1; state_set XRAY_PORT "$port"
@@ -1838,6 +2158,10 @@ xray_install() {
 
 xray_upgrade() {
   command -v xray >/dev/null 2>&1 || die "Xray 尚未安装。" 4
+  if is_alpine; then
+    upgrade_alpine_xray
+    return
+  fi
   local installer service_user
   installer="$(make_temp)"; download_file "$XRAY_INSTALLER_URL" "$installer"; bash -n "$installer" || die "官方安装器语法检查失败。" 5
   bash "$installer" install
@@ -1849,9 +2173,41 @@ xray_upgrade() {
   xray version | head -n 1
 }
 
+upgrade_alpine_xray() {
+  local release_dir backup port
+  xray_managed_openrc || die "Xray OpenRC 服务不属于 vpsinit，拒绝升级。" 4
+  port="$(xray_config_port)"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "无法确定当前 Xray 端口。" 6
+  release_dir="$(download_alpine_xray_release)"
+  chown root:"$XRAY_ALPINE_USER" "$RUNTIME_DIR" "$release_dir" "$release_dir/xray"
+  chmod 0710 "$RUNTIME_DIR" "$release_dir"
+  chmod 0750 "$release_dir/xray"
+  runuser -u "$XRAY_ALPINE_USER" -- "$release_dir/xray" run -test -config "$XRAY_CONFIG"
+  backup="$(make_temp)"
+  cp -p "$XRAY_BIN" "$backup"
+  if service_active xray; then rc-service xray stop; fi
+  if ! install_alpine_xray_binary "$release_dir/xray" || ! start_and_check_alpine_xray "$port"; then
+    rc-service xray stop >/dev/null 2>&1 || true
+    if install_alpine_xray_binary "$backup" && start_and_check_alpine_xray "$port"; then
+      die "Xray 升级失败，已恢复原版本。" 6
+    fi
+    die "Xray 升级后启动失败，原版本未能自动恢复。" 6
+  fi
+  log_ok "Xray 已升级到官方最新稳定版。"
+  "$XRAY_BIN" version | head -n 1
+}
+
+start_and_check_alpine_xray() {
+  rc-service xray start || return
+  sleep 1
+  service_active xray && port_is_listening "$1"
+}
+
 xray_configure() {
   [[ -r "$XRAY_CONFIG" ]] || die "Xray 尚未由 vpsinit 安装。" 4
-  local old_port port uuid private_key public_key short_id target endpoint node_name keys current config_backup
+  local old_port port uuid private_key public_key short_id target endpoint node_name keys current config_backup service
+  if is_alpine && ! xray_managed_openrc; then die "Xray OpenRC 服务不属于 vpsinit，拒绝修改。" 4; fi
+  service="$(xray_service_name)"
   old_port="$(state_get XRAY_PORT 2>/dev/null || xray_config_port)"
   [[ "$old_port" =~ ^[0-9]+$ ]] || die "无法确定当前 Xray 端口。" 6
   port="$(read_free_port '新的 Xray 端口' "$old_port" "$old_port")"
@@ -1870,23 +2226,23 @@ xray_configure() {
   node_name="$(prompt_node_name)"
   config_backup="$(make_temp)"; cp -a "$XRAY_CONFIG" "$config_backup"
   write_xray_config "$port" "$uuid" "$private_key" "$short_id" "$target"
-  if ! systemctl restart "$XRAY_SERVICE"; then
-    cp -a "$config_backup" "$XRAY_CONFIG"; systemctl restart "$XRAY_SERVICE" || true
+  if ! service_restart "$service"; then
+    cp -a "$config_backup" "$XRAY_CONFIG"; service_restart "$service" || true
     die "Xray 配置修改后启动失败，已恢复原配置。" 6
   fi
   sleep 1
-  if ! systemctl is-active --quiet "$XRAY_SERVICE" || ! port_is_listening "$port"; then
-    cp -a "$config_backup" "$XRAY_CONFIG"; systemctl restart "$XRAY_SERVICE" || true
+  if ! service_active "$service" || ! port_is_listening "$port"; then
+    cp -a "$config_backup" "$XRAY_CONFIG"; service_restart "$service" || true
     die "Xray 新配置未正常运行，已恢复原配置。" 6
   fi
   if [[ "$port" != "$old_port" ]]; then
     if ! ufw_delete_owned XRAY; then
-      cp -a "$config_backup" "$XRAY_CONFIG"; systemctl restart "$XRAY_SERVICE" || true
+      cp -a "$config_backup" "$XRAY_CONFIG"; service_restart "$service" || true
       die "旧 Xray UFW 规则删除失败，已恢复原配置。" 6
     fi
     if ! ufw_allow_owned "$port" XRAY; then
       ufw_allow_owned "$old_port" XRAY || true
-      cp -a "$config_backup" "$XRAY_CONFIG"; systemctl restart "$XRAY_SERVICE" || true
+      cp -a "$config_backup" "$XRAY_CONFIG"; service_restart "$service" || true
       die "新 Xray UFW 规则创建失败，已恢复原配置。" 6
     fi
   fi
@@ -1898,16 +2254,18 @@ xray_configure() {
 
 xray_uninstall() {
   xray_present || { log_warn "Xray 未安装。"; return; }
+  if is_alpine && ! xray_managed_openrc; then die "Xray OpenRC 服务不属于 vpsinit，拒绝卸载。" 4; fi
   confirm_danger "将彻底删除 Xray、配置、密钥、日志和对应 UFW 规则，不做备份。" || return
-  local installer
-  installer="$(make_temp)"; download_file "$XRAY_INSTALLER_URL" "$installer"; bash -n "$installer" || die "官方安装器语法检查失败。" 5
-  if ! bash "$installer" remove --purge; then
-    log_warn "Xray 官方卸载器执行失败，将继续清理已知的托管资源。"
+  if is_alpine; then
+    remove_alpine_xray
+  else
+    local installer
+    installer="$(make_temp)"; download_file "$XRAY_INSTALLER_URL" "$installer"; bash -n "$installer" || die "官方安装器语法检查失败。" 5
+    if ! bash "$installer" remove --purge; then
+      log_warn "Xray 官方卸载器执行失败，将继续清理已知的托管资源。"
+    fi
+    cleanup_systemd_xray
   fi
-  systemctl disable --now "$XRAY_SERVICE" >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service /usr/local/bin/xray
-  rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d /usr/local/etc/xray /usr/local/share/xray /var/log/xray
-  systemctl daemon-reload >/dev/null 2>&1 || true
   ufw_delete_owned XRAY || log_warn "Xray 已删除，但对应 UFW 规则未能自动清理。"
   state_delete XRAY_INSTALLED
   state_delete XRAY_PORT
@@ -1922,18 +2280,25 @@ xray_uninstall() {
 xray_status() {
   printf 'vpsinit: %s\n' "$TOOL_VERSION"
   if command -v xray >/dev/null 2>&1; then xray version | head -n 1; else log_warn "Xray 未安装。"; return; fi
-  systemctl --no-pager --full status "$XRAY_SERVICE" || true
+  if is_alpine; then rc-service xray status || true; else systemctl --no-pager --full status "$XRAY_SERVICE" || true; fi
   xray run -test -config "$XRAY_CONFIG" || true
   local port; port="$(state_get XRAY_PORT 2>/dev/null || true)"; [[ -n "$port" ]] && ss -lntup | awk -v p=":$port" 'NR==1 || $5 ~ p"$"'
   command -v ufw >/dev/null 2>&1 && ufw status || true
 }
 
-xray_logs() { journalctl -u "$XRAY_SERVICE" --lines 100 --follow --no-pager; }
+xray_logs() {
+  if is_alpine; then
+    [[ -f "$XRAY_LOG" ]] || die "没有可读的 Xray 日志：${XRAY_LOG}。" 4
+    tail -n 100 -f "$XRAY_LOG"
+  else
+    journalctl -u "$XRAY_SERVICE" --lines 100 --follow --no-pager
+  fi
+}
 
 self_update() {
   local temp
   temp="$(make_temp)"; download_file "$SELF_URL" "$temp"; grep -q 'TOOL_NAME="vpsinit"' "$temp" || die "下载内容不正确。" 5; bash -n "$temp" || die "新版本语法检查失败。" 5
-  install -o root -g root -m 0755 "$temp" "$INSTALL_PATH"
+  install -D -o root -g root -m 0755 "$temp" "$INSTALL_PATH"
   log_ok "vpsinit 已从 main 分支更新。"
 }
 

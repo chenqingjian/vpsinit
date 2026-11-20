@@ -385,6 +385,11 @@ grep -Fq 'ssh_ports_are_safe_to_migrate "${configured_ports[@]}"' "$ROOT_DIR/vps
 grep -Fq 'prior_ufw_ssh_port="$(state_get UFW_SSH_PORT' "$ROOT_DIR/vpsinit.sh" || fail 'prior owned SSH UFW rule is not tracked'
 if grep -Fq 'delete allow "$old_port/tcp"' "$ROOT_DIR/vpsinit.sh"; then fail 'SSH migration still deletes an unowned old-port UFW rule'; fi
 grep -q 'show_xray_client "$@" >/dev/tty' "$ROOT_DIR/vpsinit.sh" || fail 'one-time Xray output is not terminal-only'
+client_output="$(show_xray_client node.example 443 fixture-uuid fixture-key 0123 target.example 'Test Node')"
+awk '/^  reality-opts:$/ {in_reality=1; next} /^  [^ ]/ {in_reality=0} in_reality && /^    support-x25519mlkem768: true$/ {found=1} END {exit !found}' <<<"$client_output" \
+  || fail 'Mihomo REALITY hybrid key exchange option missing'
+grep -Eq '^vless://[^#]+&support-x25519mlkem768=true#Test%20Node$' <<<"$client_output" \
+  || fail 'VLESS URL missing hybrid key exchange query parameter before the node name'
 grep -Fq '请输入客户端节点名称（用于 VLESS 分享链接和 Clash/Mihomo 节点）' "$ROOT_DIR/vpsinit.sh" || fail 'manual client node name prompt missing'
 if grep -Fq '#vpsinit' "$ROOT_DIR/vpsinit.sh" || grep -Fq -- '- name: vpsinit' "$ROOT_DIR/vpsinit.sh"; then fail 'hard-coded client node name remains'; fi
 grep -q 'temp="$(make_temp_json)"' "$ROOT_DIR/vpsinit.sh" || fail 'Xray config validation does not use JSON temp file'

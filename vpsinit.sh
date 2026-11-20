@@ -1753,7 +1753,7 @@ show_xray_client() {
   encoded_name="$(urlencode "$node_name")"
   yaml_name="$(yaml_double_quote "$node_name")"
   printf '\n%sVLESS 分享链接（仅显示本次）：%s\n' "$GREEN" "$NC"
-  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' "$uuid" "$endpoint" "$port" "$encoded_target" "$public_key" "$short_id" "$encoded_name"
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&support-x25519mlkem768=true#%s\n' "$uuid" "$endpoint" "$port" "$encoded_target" "$public_key" "$short_id" "$encoded_name"
   printf '\n%sClash/Mihomo 节点（仅显示本次）：%s\n' "$GREEN" "$NC"
   cat <<EOF
 - name: $yaml_name
@@ -1769,6 +1769,7 @@ show_xray_client() {
   reality-opts:
     public-key: $public_key
     short-id: $short_id
+    support-x25519mlkem768: true
   client-fingerprint: chrome
 EOF
 }

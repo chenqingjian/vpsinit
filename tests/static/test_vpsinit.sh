@@ -175,8 +175,14 @@ apply_ipv6_disable_values
 IPV6_CONF_DIR="$ORIGINAL_IPV6_CONF_DIR"
 IPV6_SNAPSHOT="$ORIGINAL_IPV6_SNAPSHOT"
 
-JSON_TEMP="$(make_temp_json)"
-[[ "$JSON_TEMP" == *.json && -f "$JSON_TEMP" ]] || fail 'Xray temporary config does not use .json suffix'
+(
+  mktemp() {
+    [[ "$1" == *XXXXXX ]] || return 1
+    command mktemp "$@"
+  }
+  JSON_TEMP="$(make_temp_json)" || fail 'Xray JSON temp file fails with BusyBox mktemp template rules'
+  [[ "$JSON_TEMP" == *.json && -f "$JSON_TEMP" ]] || fail 'Xray temporary config does not use .json suffix'
+)
 
 TEST_PORT_COUNTER="$RUNTIME_DIR/test-port-counter"
 printf '0\n' > "$TEST_PORT_COUNTER"
@@ -279,7 +285,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.38' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.39' ]] || fail 'version command output mismatch'
 grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'

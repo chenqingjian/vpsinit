@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.38"
+TOOL_VERSION="0.1.39"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -62,7 +62,11 @@ make_temp() {
 }
 
 make_temp_json() {
-  mktemp "$RUNTIME_DIR/file.XXXXXX.json"
+  local temp
+  # BusyBox mktemp requires the template to end in XXXXXX.
+  temp="$(make_temp)" || return
+  mv -- "$temp" "$temp.json" || return
+  printf '%s.json\n' "$temp"
 }
 
 require_root() {

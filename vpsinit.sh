@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.39"
+TOOL_VERSION="0.1.40"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -15,6 +15,7 @@ LOG_FILE="$LOG_DIR/vpsinit.log"
 LOCK_FILE="/run/lock/vpsinit.lock"
 XRAY_INSTALLER_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_ALPINE_CONFIG="/etc/vpsinit-xray/config.json"
 XRAY_SERVICE="xray.service"
 XRAY_OPENRC_SCRIPT="/etc/init.d/xray"
 XRAY_LOG="/var/log/xray/service.log"
@@ -113,6 +114,7 @@ check_platform() {
   if is_alpine; then
     command -v rc-service >/dev/null && command -v rc-update >/dev/null \
       && [[ -d /run/openrc ]] || die "Alpine 必须运行 OpenRC。" 3
+    select_alpine_xray_config
     IPV6_BOOT_SERVICE_NAME="vpsinit-disable-ipv6"
     IPV6_BOOT_SERVICE="/etc/init.d/$IPV6_BOOT_SERVICE_NAME"
   else
@@ -121,6 +123,10 @@ check_platform() {
 }
 
 is_alpine() { [[ "$SYSTEM_ID" == alpine ]]; }
+
+select_alpine_xray_config() {
+  if [[ -e "$XRAY_ALPINE_CONFIG" || ! -e "$XRAY_CONFIG" ]]; then XRAY_CONFIG="$XRAY_ALPINE_CONFIG"; fi
+}
 
 service_active() {
   if is_alpine; then rc-service "$1" status >/dev/null 2>&1; else systemctl is-active --quiet "$1"; fi
@@ -1956,7 +1962,7 @@ yaml_double_quote() {
 }
 
 write_xray_config() {
-  local port="$1" uuid="$2" private_key="$3" short_id="$4" target="$5" temp service_user service_group
+  local port="$1" uuid="$2" private_key="$3" short_id="$4" target="$5" temp service_user service_group config_dir
   temp="$(make_temp_json)"
   cat > "$temp" <<EOF
 {
@@ -2038,8 +2044,17 @@ EOF
   chown root:"$service_group" "$temp"
   chmod 0640 "$temp"
   runuser -u "$service_user" -- xray run -test -config "$temp"
-  install -d -o root -g "$service_group" -m 0750 "$(dirname "$XRAY_CONFIG")"
+  config_dir="$(dirname "$XRAY_CONFIG")"
+  install -d -o root -g "$service_group" -m 0750 "$config_dir"
+  if is_alpine; then
+    runuser -u "$service_user" -- sh -c 'test -x "$1"' sh "$config_dir" \
+      || die "Xray 服务用户无法进入配置目录：${config_dir}。" 6
+  fi
   install -o root -g "$service_group" -m 0640 "$temp" "$XRAY_CONFIG"
+  if is_alpine; then
+    runuser -u "$service_user" -- test -r "$XRAY_CONFIG" \
+      || die "Xray 服务用户无法读取已安装的配置：${XRAY_CONFIG}。" 6
+  fi
 }
 
 show_xray_client() {
@@ -2085,7 +2100,8 @@ xray_config_target() { sed -n 's/.*"serverNames": \["\([^"]*\)"\].*/\1/p' "$XRAY
 xray_present() {
   if command -v xray >/dev/null 2>&1 || [[ -e "$XRAY_BIN" || -e "$XRAY_CONFIG" ]]; then return 0; fi
   if is_alpine; then
-    [[ -e "$XRAY_OPENRC_SCRIPT" || -e /etc/conf.d/xray || -e /var/log/xray || -e /usr/local/etc/xray ]]
+    [[ -e "$XRAY_OPENRC_SCRIPT" || -e /etc/conf.d/xray || -e /usr/local/etc/xray \
+      || -e "$(dirname "$XRAY_CONFIG")" || -e "$(dirname "$XRAY_LOG")" ]]
   else
     systemctl cat "$XRAY_SERVICE" >/dev/null 2>&1
   fi
@@ -2097,7 +2113,7 @@ remove_alpine_xray() {
     service_disable_now xray || die "无法停止或取消 Xray 的开机启动，未删除文件。" 6
   fi
   rm -f "$XRAY_OPENRC_SCRIPT" "$XRAY_BIN"
-  rm -rf /usr/local/etc/xray /var/log/xray
+  rm -rf -- "$(dirname "$XRAY_CONFIG")" "$(dirname "$XRAY_LOG")"
   if [[ "$(state_get XRAY_ALPINE_USER_CREATED 2>/dev/null || true)" == 1 ]]; then
     deluser "$XRAY_ALPINE_USER"
     state_delete XRAY_ALPINE_USER_CREATED
@@ -2108,9 +2124,16 @@ remove_alpine_xray() {
   fi
 }
 
+save_alpine_xray_startup_log() {
+  [[ -s "$XRAY_LOG" ]] || return 0
+  install -m 0600 "$XRAY_LOG" "$LOG_DIR/xray-startup.log" || return
+  log_warn "已保留 Xray 启动日志，可用 vpsinit xray logs 查看。"
+}
+
 cleanup_failed_xray_install() {
   log_warn "Xray 安装未完成，正在清理本次创建的资源。"
   if is_alpine; then
+    save_alpine_xray_startup_log || log_warn "无法保存 Xray 启动日志。"
     remove_alpine_xray
   else
     cleanup_systemd_xray
@@ -2138,12 +2161,17 @@ perform_xray_install() {
   node_name="$(prompt_node_name)"
   write_xray_config "$port" "$uuid" "$private_key" "$short_id" "$target"
   service_enable_now "$service"
-  if ! is_alpine; then service_restart "$service"; fi
-  sleep 1
-  service_active "$service" || die "Xray 服务启动失败。" 6
-  port_is_listening "$port" || die "Xray 未监听端口 ${port}。" 6
+  if is_alpine; then
+    wait_for_alpine_xray_listener "$port" || die "Xray 启动后未在 TCP 端口 ${port} 就绪。" 6
+  else
+    service_restart "$service"
+    sleep 1
+    service_active "$service" || die "Xray 服务启动失败。" 6
+    port_is_listening "$port" || die "Xray 未监听端口 ${port}。" 6
+  fi
   ufw_allow_owned "$port" XRAY
   state_set XRAY_INSTALLED 1; state_set XRAY_PORT "$port"
+  if is_alpine; then rm -f "$LOG_DIR/xray-startup.log"; fi
   log_ok "Xray 安装完成。"
   show_xray_client_once "$endpoint" "$port" "$uuid" "$public_key" "$short_id" "$target" "$node_name"
 }
@@ -2203,8 +2231,19 @@ upgrade_alpine_xray() {
 
 start_and_check_alpine_xray() {
   rc-service xray start || return
-  sleep 1
-  service_active xray && port_is_listening "$1"
+  wait_for_alpine_xray_listener "$1"
+}
+
+wait_for_alpine_xray_listener() {
+  local attempts=0 sockets
+  while (( attempts < 12 )); do
+    if service_active xray && sockets="$(ss -H -ltn "sport = :$1")" && [[ -n "$sockets" ]]; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    if (( attempts < 12 )); then sleep 1; fi
+  done
+  return 1
 }
 
 xray_configure() {
@@ -2234,8 +2273,7 @@ xray_configure() {
     cp -a "$config_backup" "$XRAY_CONFIG"; service_restart "$service" || true
     die "Xray 配置修改后启动失败，已恢复原配置。" 6
   fi
-  sleep 1
-  if ! service_active "$service" || ! port_is_listening "$port"; then
+  if ! xray_listener_ready "$service" "$port"; then
     cp -a "$config_backup" "$XRAY_CONFIG"; service_restart "$service" || true
     die "Xray 新配置未正常运行，已恢复原配置。" 6
   fi
@@ -2256,12 +2294,22 @@ xray_configure() {
   show_xray_client_once "$endpoint" "$port" "$uuid" "$public_key" "$short_id" "$target" "$node_name"
 }
 
+xray_listener_ready() {
+  if is_alpine; then
+    wait_for_alpine_xray_listener "$2"
+  else
+    sleep 1
+    service_active "$1" && port_is_listening "$2"
+  fi
+}
+
 xray_uninstall() {
   xray_present || { log_warn "Xray 未安装。"; return; }
   if is_alpine && ! xray_managed_openrc; then die "Xray OpenRC 服务不属于 vpsinit，拒绝卸载。" 4; fi
   confirm_danger "将彻底删除 Xray、配置、密钥、日志和对应 UFW 规则，不做备份。" || return
   if is_alpine; then
     remove_alpine_xray
+    rm -f "$LOG_DIR/xray-startup.log"
   else
     local installer
     installer="$(make_temp)"; download_file "$XRAY_INSTALLER_URL" "$installer"; bash -n "$installer" || die "官方安装器语法检查失败。" 5
@@ -2292,8 +2340,13 @@ xray_status() {
 
 xray_logs() {
   if is_alpine; then
-    [[ -f "$XRAY_LOG" ]] || die "没有可读的 Xray 日志：${XRAY_LOG}。" 4
-    tail -n 100 -f "$XRAY_LOG"
+    if [[ -f "$XRAY_LOG" ]]; then
+      tail -n 100 -f "$XRAY_LOG"
+    elif [[ -f "$LOG_DIR/xray-startup.log" ]]; then
+      tail -n 100 "$LOG_DIR/xray-startup.log"
+    else
+      die "没有可读的 Xray 日志：${XRAY_LOG}。" 4
+    fi
   else
     journalctl -u "$XRAY_SERVICE" --lines 100 --follow --no-pager
   fi

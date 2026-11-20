@@ -285,7 +285,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.39' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.40' ]] || fail 'version command output mismatch'
 grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
@@ -437,6 +437,16 @@ grep -q "SELF_URL=\"https://raw.githubusercontent.com/chenqingjian/vpsinit/main/
   [[ "$(alpine_xray_asset arm64)" == Xray-linux-arm64-v8a.zip ]] || fail 'Alpine ARM64 release mismatch'
   [[ "$(xray_service_user)" == vpsinit-xray ]] || fail 'Alpine Xray must use the dedicated service account'
   [[ "$(xray_service_name)" == xray ]] || fail 'Alpine Xray OpenRC service name mismatch'
+  (
+    XRAY_CONFIG="$RUNTIME_DIR/legacy-xray.json"
+    XRAY_ALPINE_CONFIG="$RUNTIME_DIR/new-xray.json"
+    touch "$XRAY_CONFIG"
+    select_alpine_xray_config
+    [[ "$XRAY_CONFIG" == "$RUNTIME_DIR/legacy-xray.json" ]] || fail 'existing Alpine Xray config was not preserved'
+    rm "$XRAY_CONFIG"
+    select_alpine_xray_config
+    [[ "$XRAY_CONFIG" == "$XRAY_ALPINE_CONFIG" ]] || fail 'fresh Alpine install uses legacy config path'
+  )
 
   calls="$RUNTIME_DIR/alpine-calls"
   systemctl() { fail 'unexpected systemctl on Alpine'; }
@@ -485,6 +495,18 @@ grep -q "SELF_URL=\"https://raw.githubusercontent.com/chenqingjian/vpsinit/main/
   service_enable_now xray
   assert_true service_enabled xray
   assert_true service_active xray
+  (
+    sleep() { touch "$RUNTIME_DIR/mock-xray-ready"; }
+    ss() {
+      [[ "$1:$2:$3" == '-H:-ltn:sport = :443' ]] || fail 'unexpected Alpine Xray socket check'
+      if [[ -e "$RUNTIME_DIR/mock-xray-ready" ]]; then printf 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\n'; fi
+    }
+    assert_true wait_for_alpine_xray_listener 443
+    [[ -e "$RUNTIME_DIR/mock-xray-ready" ]] || fail 'Xray readiness probe did not retry'
+    sleep() { :; }
+    ss() { :; }
+    assert_false wait_for_alpine_xray_listener 443
+  )
   service_disable_now xray
   assert_false service_enabled xray
   assert_false service_active xray
@@ -507,6 +529,15 @@ grep -q "SELF_URL=\"https://raw.githubusercontent.com/chenqingjian/vpsinit/main/
   assert_false ipv6_disable_persistence_ready
   [[ ! -e "$IPV6_BOOT_HELPER" && ! -e "$IPV6_BOOT_SERVICE" ]] || fail 'IPv6 persistence files not removed'
   unset -f install
+
+  (
+    LOG_DIR="$RUNTIME_DIR"
+    XRAY_LOG="$RUNTIME_DIR/mock-xray-service.log"
+    printf 'mock startup failure\n' >"$XRAY_LOG"
+    save_alpine_xray_startup_log
+    rm "$XRAY_LOG"
+    [[ "$(xray_logs)" == 'mock startup failure' ]] || fail 'Alpine Xray logs lost startup failure after rollback'
+  )
 
   asset_url='https://github.com/XTLS/Xray-core/releases/download/v1.0.0/Xray-linux-arm64-v8a.zip'
   printf 'synthetic release archive' >"$RUNTIME_DIR/archive-fixture"

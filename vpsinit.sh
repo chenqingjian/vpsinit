@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.41"
+TOOL_VERSION="0.1.42"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -954,6 +954,30 @@ alpine_ssh_log_path() {
   return 1
 }
 
+wait_for_fail2ban_sshd() {
+  local attempt
+  for (( attempt=1; attempt<=10; attempt++ )); do
+    if service_active fail2ban && timeout 2 fail2ban-client status sshd >/dev/null 2>&1; then
+      return 0
+    fi
+    if (( attempt < 10 )); then sleep 1; fi
+  done
+  return 1
+}
+
+report_fail2ban_start_failure() {
+  timeout 2 fail2ban-client status sshd >&2 || true
+  if is_alpine; then
+    rc-service fail2ban status >&2 || true
+  else
+    systemctl --no-pager -l status fail2ban.service >&2 || true
+    journalctl -u fail2ban.service -n 20 --no-pager >&2 || true
+  fi
+  if [[ -r /var/log/fail2ban.log ]]; then
+    tail -n 20 /var/log/fail2ban.log >&2 || true
+  fi
+}
+
 configure_fail2ban() {
   ensure_package_installed fail2ban
   local retries minutes port temp filter_temp test_log matched_ip backend=systemd log_path=""
@@ -1016,13 +1040,17 @@ backend = polling
 logpath = $log_path
 banaction = nftables-multiport
 EOF
+  else
+    # Debian's package defaults set journalmatch at the jail level.
+    printf '%s\n' 'journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session' >>"$temp"
   fi
   install -d -m 0755 /etc/fail2ban/jail.d
   install -o root -g root -m 0644 "$temp" "$FAIL2BAN_JAIL"
-  fail2ban-client -t
-  service_enable_now fail2ban
-  service_restart fail2ban
-  fail2ban-client status sshd >/dev/null || die "Fail2ban sshd jail 未启动。" 6
+  fail2ban-client -t || die "Fail2ban 配置检查失败。" 6
+  if ! service_enable_now fail2ban || ! service_restart fail2ban || ! wait_for_fail2ban_sshd; then
+    report_fail2ban_start_failure
+    die "Fail2ban 启动失败，或 sshd jail 未在限时内就绪。请查看上方诊断。" 6
+  fi
   log_ok "Fail2ban 已启用：10 分钟内失败 $retries 次，封禁 $minutes 分钟。"
 }
 
@@ -1072,7 +1100,11 @@ enable_fail2ban() {
     die "当前系统未安装 Fail2ban，请先执行 vpsinit system fail2ban。" 4
   fi
   if service_active fail2ban && service_enabled fail2ban; then
-    log_ok "Fail2ban 已处于运行且开机启用状态。"
+    if ! wait_for_fail2ban_sshd; then
+      report_fail2ban_start_failure
+      die "Fail2ban 服务正在运行，但 sshd jail 未就绪。请查看上方诊断。" 6
+    fi
+    log_ok "Fail2ban 已启用，sshd jail 正常运行。"
     return 0
   fi
   if [[ ! -r "$FAIL2BAN_JAIL" ]] || ! grep -Fqx '# Managed by vpsinit' "$FAIL2BAN_JAIL"; then
@@ -1091,12 +1123,14 @@ enable_fail2ban() {
     log_path="$(alpine_ssh_log_path)" || die "未收到 SSH auth 日志，拒绝启用 Fail2ban。" 4
     grep -Fxq "logpath = $log_path" "$FAIL2BAN_JAIL" || die "SSH 日志路径已变化，请重新配置 Fail2ban。" 4
   fi
-  fail2ban-client -t
+  fail2ban-client -t || die "Fail2ban 配置检查失败。" 6
   ask_yes_no "是否启用 Fail2ban？" n || { log_info "保持 Fail2ban 停用。"; return 0; }
-  service_enable_now fail2ban
-  if ! service_active fail2ban || ! fail2ban-client status sshd >/dev/null 2>&1; then
-    service_disable_now fail2ban >/dev/null 2>&1 || true
-    die "Fail2ban 启用后服务或 sshd jail 验证失败，已重新停用服务。" 6
+  if ! service_enable_now fail2ban || ! wait_for_fail2ban_sshd; then
+    report_fail2ban_start_failure
+    if service_disable_now fail2ban >/dev/null 2>&1; then
+      die "Fail2ban 启用后服务或 sshd jail 验证失败，已重新停用服务。" 6
+    fi
+    die "Fail2ban 启用后验证失败，且未能重新停用服务。请查看上方诊断。" 6
   fi
   log_ok "Fail2ban 已启用，sshd jail 正常运行。"
 }

@@ -118,6 +118,55 @@ FAIL2BAN_JAIL="$RUNTIME_DIR/fail2ban-jail.local"
 printf '# Managed by vpsinit\n[sshd]\nport = 58911\n' > "$FAIL2BAN_JAIL"
 [[ "$(fail2ban_configured_ssh_port)" == 58911 ]] || fail 'Fail2ban configured SSH port parse failed'
 FAIL2BAN_JAIL="$ORIGINAL_FAIL2BAN_JAIL"
+(
+  FAIL2BAN_JAIL="$RUNTIME_DIR/jail-generated.local"
+  FAIL2BAN_SSHD_FILTER="$RUNTIME_DIR/filter-generated.conf"
+  ensure_package_installed() { :; }
+  read_range() { printf '%s\n' "$2"; }
+  effective_ssh_port() { printf '58911\n'; }
+  fail2ban-regex() { printf '192.0.2.123\n'; }
+  fail2ban-client() { [[ "$1" == -t ]]; }
+  service_enable_now() { :; }
+  service_restart() { :; }
+  wait_for_fail2ban_sshd() { :; }
+  install() {
+    case "${@: -1}" in
+      /etc/fail2ban/filter.d|/etc/fail2ban/jail.d) return 0 ;;
+      "$FAIL2BAN_JAIL"|"$FAIL2BAN_SSHD_FILTER") cp -- "${@: -2:1}" "${@: -1}" ;;
+      *) return 1 ;;
+    esac
+  }
+  is_alpine() { return 1; }
+  configure_fail2ban >/dev/null
+  grep -Fxq 'journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session' "$FAIL2BAN_JAIL" \
+    || fail 'Fail2ban managed jail did not override the Debian journalmatch default'
+
+  is_alpine() { return 0; }
+  nft() { :; }
+  alpine_ssh_log_path() { printf '/var/log/auth.log\n'; }
+  configure_fail2ban >/dev/null
+  grep -Fxq 'backend = polling' "$FAIL2BAN_JAIL" || fail 'Alpine Fail2ban jail lost its polling backend'
+  if grep -q '^journalmatch' "$FAIL2BAN_JAIL"; then fail 'Alpine Fail2ban jail gained a journalmatch override'; fi
+)
+(
+  fail2ban_checks=0
+  fail2ban_sleeps=0
+  service_active() { [[ "$1" == fail2ban ]] && (( fail2ban_sleeps >= 1 )); }
+  timeout() {
+    [[ "$#" == 4 && "$1" == 2 && "$2" == fail2ban-client && "$3" == status && "$4" == sshd ]] || return 2
+    (( ++fail2ban_checks >= 3 ))
+  }
+  sleep() { (( ++fail2ban_sleeps )); }
+  assert_true wait_for_fail2ban_sshd
+  [[ "$fail2ban_checks:$fail2ban_sleeps" == 3:3 ]] || fail 'Fail2ban readiness did not wait for service and jail'
+
+  fail2ban_checks=0
+  fail2ban_sleeps=0
+  service_active() { return 0; }
+  timeout() { (( ++fail2ban_checks )); return 1; }
+  assert_false wait_for_fail2ban_sshd
+  [[ "$fail2ban_checks:$fail2ban_sleeps" == 10:9 ]] || fail 'Fail2ban readiness did not stop at the retry limit'
+)
 [[ "$(printf '\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest manual@example\n' | prompt_root_ssh_key 2>/dev/null)" == 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest manual@example' ]] || fail 'manual SSH key input failed'
 [[ "$(printf '\n58911\n' | read_required_port 'test' 2>/dev/null)" == 58911 ]] || fail 'required SSH port input failed'
 
@@ -302,7 +351,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.41' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.42' ]] || fail 'version command output mismatch'
 grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'

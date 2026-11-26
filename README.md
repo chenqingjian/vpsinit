@@ -6,7 +6,7 @@
 
 - 官方 Debian 12/13
 - 官方 Ubuntu 24.04 及后续 LTS 版本
-- 官方 Alpine Linux 3.23/3.24（OpenRC，`vpsinit` 和 `kmrinit` 均适用）
+- 官方 Alpine Linux 3.21 及后续正式版本（OpenRC，`vpsinit` 和 `kmrinit` 均适用）
 - `amd64/x86_64` 或 64 位 `arm64/aarch64`
 - Debian/Ubuntu 使用 systemd，Alpine 使用 OpenRC
 - root 用户执行

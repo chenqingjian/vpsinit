@@ -351,7 +351,7 @@ grep -q 'vpsinit system fail2ban-status' <<<"$help_output" || fail 'help missing
 grep -q 'vpsinit system fail2ban-enable' <<<"$help_output" || fail 'help missing Fail2ban enable command'
 grep -q 'vpsinit system fail2ban-disable' <<<"$help_output" || fail 'help missing Fail2ban disable command'
 grep -q 'vpsinit version' <<<"$help_output" || fail 'help missing version command'
-[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.42' ]] || fail 'version command output mismatch'
+[[ "$(bash "$ROOT_DIR/vpsinit.sh" version)" == 'vpsinit 0.1.43' ]] || fail 'version command output mismatch'
 grep -Fq 'vpsinit update|self-update' <<<"$help_output" || fail 'help missing update alias'
 
 grep -q 'LLMNR=no' "$ROOT_DIR/vpsinit.sh" || fail 'LLMNR setting missing'
@@ -494,9 +494,15 @@ grep -q "SELF_URL=\"https://raw.githubusercontent.com/chenqingjian/vpsinit/main/
 (
   SYSTEM_ID=alpine
   SYSTEM_ARCH=arm64
+  assert_true platform_supported alpine 3.21
+  assert_true platform_supported alpine 3.21.0
+  assert_true platform_supported alpine 3.22.1
   assert_true platform_supported alpine 3.23.2
   assert_true platform_supported alpine 3.24
-  assert_false platform_supported alpine 3.22.1
+  assert_true platform_supported alpine 3.25.1
+  assert_true platform_supported alpine 4.0
+  assert_false platform_supported alpine 3.20.9
+  assert_false platform_supported alpine 3.21.0_rc1
   assert_false platform_supported alpine edge
   [[ "$(distro_connectivity_host)" == dl-cdn.alpinelinux.org ]] || fail 'Alpine connectivity host mismatch'
   [[ "$(alpine_xray_asset amd64)" == Xray-linux-64.zip ]] || fail 'Alpine x86_64 release mismatch'

@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT_DIR/kmrinit.sh"
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
-[[ "$TOOL_VERSION" == '0.1.7' ]] || fail 'version constant mismatch'
+[[ "$TOOL_VERSION" == '0.1.8' ]] || fail 'version constant mismatch'
 if grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' "$ROOT_DIR/kmrinit.sh"; then fail 'unbraced variable adjacent to non-ASCII text'; fi
 grep -Fq '8) self_update; restart_after_self_update ;;' "$ROOT_DIR/kmrinit.sh" || fail 'menu self-update does not restart the new script'
 grep -Fq 'flock -u 9' "$ROOT_DIR/kmrinit.sh" || fail 'menu self-update does not release the operation lock'
@@ -20,9 +20,15 @@ assert_true platform_supported debian 12
 assert_true platform_supported debian 13
 assert_true platform_supported ubuntu 24.04
 assert_true platform_supported ubuntu 26.04
+assert_true platform_supported alpine 3.21
+assert_true platform_supported alpine 3.21.0
+assert_true platform_supported alpine 3.22.1
 assert_true platform_supported alpine 3.23.1
 assert_true platform_supported alpine 3.24
-assert_false platform_supported alpine 3.22
+assert_true platform_supported alpine 3.25.1
+assert_true platform_supported alpine 4.0
+assert_false platform_supported alpine 3.20.9
+assert_false platform_supported alpine 3.21.0_rc1
 assert_false platform_supported ubuntu 22.04
 assert_false platform_supported ubuntu 24.10
 assert_false platform_supported ubuntu 25.04

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-TOOL_VERSION="0.1.42"
+TOOL_VERSION="0.1.43"
 TOOL_NAME="vpsinit"
 INSTALL_PATH="/usr/local/sbin/vpsinit"
 SELF_URL="https://raw.githubusercontent.com/chenqingjian/vpsinit/main/vpsinit.sh"
@@ -86,7 +86,10 @@ platform_supported() {
   case "$id" in
     debian) [[ "$version" == 12 || "$version" == 13 ]] ;;
     ubuntu) ubuntu_lts_supported "$version" ;;
-    alpine) [[ "$version" =~ ^3\.(23|24)(\.[0-9]+)?$ ]] ;;
+    alpine)
+      [[ "$version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]] &&
+        (( 10#${BASH_REMATCH[1]} > 3 || (10#${BASH_REMATCH[1]} == 3 && 10#${BASH_REMATCH[2]} >= 21) ))
+      ;;
     *) return 1 ;;
   esac
 }
@@ -105,7 +108,7 @@ check_platform() {
   # shellcheck disable=SC1091
   . /etc/os-release
   platform_supported "${ID:-}" "${VERSION_ID:-}" \
-    || die "仅支持 Debian 12/13、官方 Ubuntu 24.04 及后续 LTS 或 Alpine 3.23/3.24。" 3
+    || die "仅支持 Debian 12/13、官方 Ubuntu 24.04 及后续 LTS 或 Alpine 3.21 及后续正式版本。" 3
   SYSTEM_ARCH="$(normalize_arch "$(uname -m)" || true)"
   [[ -n "$SYSTEM_ARCH" ]] || die "仅支持 64 位 amd64/x86_64 或 arm64/aarch64。" 3
   SYSTEM_ID="$ID"
